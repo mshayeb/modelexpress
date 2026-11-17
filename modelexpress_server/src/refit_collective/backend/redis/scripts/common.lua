@@ -1,7 +1,10 @@
 -- Helpers shared by the collective group scripts. Redis EVAL has no `require`,
 -- so redis.rs prepends this chunk to each script that uses it when the script
--- is built. Nothing here reads ARGV, and only key_range reads KEYS: every key
--- comes in as an argument, so each script keeps its own key layout.
+-- is built. Only key_range reads KEYS directly; registration_key derives
+-- worker registration keys from `worker_key_prefix` passed via ARGV, which
+-- works in Redis Cluster EVAL because KEYS[1] (`mx:{refit}c:...`) and
+-- `worker_key_prefix` (`mx:{refit}:worker:`) share the `{refit}` hash tag and
+-- map to the same slot.
 
 local function parse_participant(record)
   if not record then
@@ -10,12 +13,12 @@ local function parse_participant(record)
   return string.match(record, '^([^|]*)|([^|]*)|([^|]*)|([^|]*)$')
 end
 
-local function registration_key(worker_id)
-  return 'mx:refit:worker:' .. worker_id
+local function registration_key(worker_key_prefix, worker_id)
+  return worker_key_prefix .. worker_id
 end
 
-local function registration_matches(worker_id, role, model_name, key)
-  key = key or registration_key(worker_id)
+local function registration_matches(worker_id, role, model_name, worker_key_prefix, key)
+  key = key or registration_key(worker_key_prefix, worker_id)
   if redis.call('EXISTS', key) ~= 1 then
     return false
   end
@@ -25,19 +28,49 @@ local function registration_matches(worker_id, role, model_name, key)
     and redis.call('HGET', key, 'model_name') == model_name
 end
 
+-- Map newline-separated operation IDs 1-to-1 onto declared KEYS entries.
+local function build_op_key_map(op_ids_blob, op_keys)
+  local map = {}
+  if not op_ids_blob or op_ids_blob == '' then
+    return map
+  end
+  local idx = 1
+  for op_id in string.gmatch(op_ids_blob .. '\n', '([^\n]*)\n') do
+    if op_id ~= '' and op_keys[idx] then
+      map[op_id] = op_keys[idx]
+      idx = idx + 1
+    end
+  end
+  return map
+end
+
+-- Verify every active operation in ops_set_key was declared in KEYS before any
+-- mutation executes, so Redis Cluster checks slot locality upfront.
+local function active_ops_covered(ops_set_key, op_key_map)
+  local op_ids = redis.call('SMEMBERS', ops_set_key)
+  for i = 1, #op_ids do
+    if not op_key_map[op_ids[i]] then
+      return false
+    end
+  end
+  return true
+end
+
 -- A group churn that invalidates the current epoch's in-flight communicator
 -- also strands any transfer op still riding it. Abort every non-terminal op
 -- this group knows about before the epoch moves out from under it.
-local function abort_stale_ops(ops_set_key, op_key_prefix)
+local function abort_stale_ops(ops_set_key, op_key_map)
   local op_ids = redis.call('SMEMBERS', ops_set_key)
   for i = 1, #op_ids do
-    local op_key = op_key_prefix .. op_ids[i]
-    local op_state = redis.call('HGET', op_key, 'state')
-    if op_state == 'PENDING' or op_state == 'RUNNING' then
-      redis.call('HSET', op_key, 'state', 'ABORTED',
-        'failure_message', 'group epoch advanced before the transfer completed')
+    local op_key = op_key_map[op_ids[i]]
+    if op_key then
+      local op_state = redis.call('HGET', op_key, 'state')
+      if op_state == 'PENDING' or op_state == 'RUNNING' then
+        redis.call('HSET', op_key, 'state', 'ABORTED',
+          'failure_message', 'group epoch advanced before the transfer completed')
+      end
+      redis.call('SREM', ops_set_key, op_ids[i])
     end
-    redis.call('SREM', ops_set_key, op_ids[i])
   end
 end
 
@@ -66,7 +99,7 @@ end
 -- skips the registration check, for a caller that has just swept lapsed
 -- registrations out of the participants hash itself.
 local function evaluate_readiness(
-    group_key, participants_key, digests_key, lane_keys, expected, epoch, model_name)
+    group_key, participants_key, digests_key, lane_keys, expected, epoch, model_name, worker_key_prefix)
   local admitted = redis.call('HLEN', participants_key)
   if expected == nil or admitted ~= expected then
     return false
@@ -78,7 +111,7 @@ local function evaluate_readiness(
     if not worker_id or tonumber(joined_epoch) ~= epoch then
       return false
     end
-    if model_name ~= nil and not registration_matches(worker_id, role, model_name) then
+    if model_name ~= nil and not registration_matches(worker_id, role, model_name, worker_key_prefix) then
       return false
     end
   end

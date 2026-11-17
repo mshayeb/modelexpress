@@ -7,6 +7,7 @@
 -- KEYS[4]: the incoming worker's TTL-bound Refit registration
 -- KEYS[5]: group active-operations set
 -- KEYS[6..5+lane_count]: one lane hash per declared lane, in declared order
+-- KEYS[6+lane_count..]: declared active operation hashes matching ARGV[17]
 -- ARGV[1]:  group_id
 -- ARGV[2]:  model_name
 -- ARGV[3]:  declared lane set, one line per lane
@@ -22,7 +23,9 @@
 -- ARGV[13]: expected_trainer_slots, newline separated
 -- ARGV[14]: expected_generator_slots, newline separated
 -- ARGV[15]: created_at_unix_ms
--- ARGV[16]: operation_key_prefix
+-- ARGV[16]: lane_count
+-- ARGV[17]: active operation IDs, newline separated
+-- ARGV[18]: worker_key_prefix
 --
 -- The shared helpers come from common.lua, which redis.rs prepends.
 
@@ -35,14 +38,16 @@ local function contains_slot(list, target)
   return false
 end
 
-local lane_count = #KEYS - 5
+local lane_count = tonumber(ARGV[16])
 local lane_keys = key_range(6, 5 + lane_count)
+local op_keys = key_range(6 + lane_count, #KEYS)
+local op_key_map = build_op_key_map(ARGV[17], op_keys)
 local expected_slots = ARGV[7] == 'TRAINER' and ARGV[13] or ARGV[14]
 if not contains_slot(expected_slots, ARGV[5]) then
   return 'UNEXPECTED_SLOT'
 end
 
-if not registration_matches(ARGV[6], ARGV[7], ARGV[2], KEYS[4]) then
+if not registration_matches(ARGV[6], ARGV[7], ARGV[2], ARGV[18], KEYS[4]) then
   return 'UNREGISTERED'
 end
 
@@ -50,6 +55,10 @@ if ARGV[10] ~= '' then
   if ARGV[7] ~= 'TRAINER' or ARGV[8] ~= '0' or ARGV[10] ~= ARGV[6] then
     return 'INVALID_PLAN_SOURCE'
   end
+end
+
+if not active_ops_covered(KEYS[5], op_key_map) then
+  return 'RETRY_ACTIVE_OPS'
 end
 
 local epoch = tonumber(redis.call('HGET', KEYS[1], 'epoch'))
@@ -68,7 +77,7 @@ if not epoch then
   for i = 1, lane_count do
     redis.call('DEL', KEYS[5 + i])
   end
-  abort_stale_ops(KEYS[5], ARGV[16])
+  abort_stale_ops(KEYS[5], op_key_map)
   redis.call('HSET', KEYS[1],
     'group_id', ARGV[1],
     'model_name', ARGV[2],
@@ -97,7 +106,7 @@ else
   for i = 1, #records, 2 do
     local slot_id = records[i]
     local worker_id, role = parse_participant(records[i + 1])
-    if not worker_id or not registration_matches(worker_id, role, ARGV[2]) then
+    if not worker_id or not registration_matches(worker_id, role, ARGV[2], ARGV[18]) then
       redis.call('HDEL', KEYS[2], slot_id)
       redis.call('HDEL', KEYS[3], slot_id)
       -- Same clearing the replacement path below does. Without it an expired
@@ -176,7 +185,7 @@ if changed then
   for i = 1, lane_count do
     redis.call('DEL', KEYS[5 + i])
   end
-  abort_stale_ops(KEYS[5], ARGV[16])
+  abort_stale_ops(KEYS[5], op_key_map)
 end
 
 redis.call('HSET', KEYS[2], ARGV[5],
@@ -191,7 +200,7 @@ if ARGV[10] ~= '' then
 end
 
 local ready = evaluate_readiness(
-  KEYS[1], KEYS[2], KEYS[3], lane_keys, tonumber(ARGV[4]), epoch, ARGV[2])
+  KEYS[1], KEYS[2], KEYS[3], lane_keys, tonumber(ARGV[4]), epoch, ARGV[2], ARGV[18])
 
 local state = ready and 'READY' or 'FORMING'
 redis.call('HSET', KEYS[1], 'state', state)

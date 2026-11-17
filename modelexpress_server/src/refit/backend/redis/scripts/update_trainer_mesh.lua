@@ -1,6 +1,6 @@
 -- Compare-and-swap membership after checking all selected workers.
 -- KEYS[1]: mesh hash; KEYS[2]: linked version IDs; KEYS[3..]: worker registrations
--- ARGV: expected_generation, workers JSON, model_name, trainer_role
+-- ARGV: expected_generation, workers JSON, model_name, trainer_role, version_key_prefix
 if redis.call('EXISTS', KEYS[1]) == 0 then
   return 'NOT_FOUND'
 end
@@ -70,9 +70,11 @@ end
 local clock = redis.call('TIME')
 local now = clock[1] * 1000 + math.floor(clock[2] / 1000)
 for _, version_id in ipairs(redis.call('SMEMBERS', KEYS[2])) do
-  local shards = 'mx:refit:version:shards:' .. version_id
-  local endpoints = 'mx:refit:version:publication-endpoints:' .. version_id
-  local leases = 'mx:refit:version:leases:' .. version_id
+  -- ARGV[5] is `mx:{refit}:version:` in cluster mode, so these undeclared
+  -- version hashes/sets share the `{refit}` hash slot with KEYS[1..].
+  local shards = ARGV[5] .. 'shards:' .. version_id
+  local endpoints = ARGV[5] .. 'publication-endpoints:' .. version_id
+  local leases = ARGV[5] .. 'leases:' .. version_id
   redis.call('ZREMRANGEBYSCORE', leases, '-inf', now)
   if redis.call('ZCARD', leases) > 0 then
     return 'VERSION_LEASED'

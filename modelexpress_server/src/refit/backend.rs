@@ -132,11 +132,26 @@ pub async fn create_backend(config: &BackendConfig) -> RefitResult<Option<Arc<dy
         BackendConfig::Redis { url } => Ok(Some(Arc::new(
             redis::RedisRefitBackend::connect(url).await?,
         ))),
-        BackendConfig::RedisCluster { .. } => Err(RefitBackendError::Unavailable(
-            "redis-cluster backend is not yet supported for refit".to_string(),
-        )),
+        BackendConfig::RedisCluster { urls } => Ok(Some(Arc::new(
+            redis::RedisRefitBackend::connect_cluster(urls).await?,
+        ))),
         BackendConfig::Kubernetes { .. } => Ok(None),
         #[cfg(feature = "memory-backend")]
         BackendConfig::Memory => Ok(None),
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::expect_used)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn create_refit_backend_rejects_empty_redis_cluster_urls() {
+        let err = create_backend(&BackendConfig::RedisCluster { urls: Vec::new() })
+            .await
+            .err()
+            .expect("empty cluster seeds must error");
+        assert!(err.to_string().contains("at least one seed URL"), "{err}");
     }
 }

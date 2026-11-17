@@ -2,6 +2,17 @@
 // SPDX-License-Identifier: Apache-2.0
 
 //! Redis implementation of the Refit control-plane backend.
+//!
+//! Standalone Redis uses the untagged `mx:refit:` prefix, whereas Redis Cluster
+//! uses `mx:{refit}:` so every Refit key (and `mx:{refit}c:` in
+//! `refit_collective`) hashes to the single `{refit}` slot on one primary.
+//! That single-primary placement is intentional: Refit RPCs look up meshes,
+//! versions, and leases by opaque ID without `model_name`, and multi-key Lua
+//! scripts atomically inspect and mutate across meshes, versions, leases, and
+//! worker registrations (`mx:{refit}:worker:<id>`). Because Refit coordinates
+//! low-frequency control-plane transitions rather than tensor data-plane
+//! traffic, keeping all `{refit}` state in one slot avoids cross-slot failures
+//! without introducing a throughput bottleneck.
 
 use std::collections::HashMap;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -16,11 +27,14 @@ use modelexpress_common::grpc::refit::{
     WeightVersionState, WorkerRegistration, WorkerRole,
 };
 use prost::Message;
-use redis::aio::ConnectionManager;
 use redis::{AsyncCommands, Script};
 use uuid::Uuid;
 
 use super::{RefitBackend, RefitBackendError, RefitResult};
+use crate::redis_conn::{RedisConnection, RedisEndpointConfig};
+
+const STANDALONE_PREFIX: &str = "mx:refit:";
+const CLUSTER_PREFIX: &str = "mx:{refit}:";
 
 const CREATE_VERSION_LUA: &str = include_str!("redis/scripts/create_weight_version.lua");
 const REGISTER_WORKER_LUA: &str = include_str!("redis/scripts/register_worker.lua");
@@ -34,48 +48,56 @@ const CREATE_MESH_LUA: &str = include_str!("redis/scripts/create_trainer_mesh.lu
 const UPDATE_MESH_LUA: &str = include_str!("redis/scripts/update_trainer_mesh.lua");
 const DELETE_MESH_LUA: &str = include_str!("redis/scripts/delete_trainer_mesh.lua");
 
-fn mesh_key(mesh_id: &str) -> String {
-    format!("mx:refit:trainer-mesh:metadata:{mesh_id}")
+fn mesh_key(prefix: &str, mesh_id: &str) -> String {
+    format!("{prefix}trainer-mesh:metadata:{mesh_id}")
 }
 
-fn mesh_versions_key(mesh_id: &str) -> String {
-    format!("mx:refit:trainer-mesh:versions:{mesh_id}")
+fn mesh_versions_key(prefix: &str, mesh_id: &str) -> String {
+    format!("{prefix}trainer-mesh:versions:{mesh_id}")
 }
 
-fn mesh_idempotency_key(model_name: &str, request_key: &str) -> String {
-    format!("mx:refit:trainer-mesh-request:{model_name}:{request_key}")
+fn mesh_idempotency_key(prefix: &str, model_name: &str, request_key: &str) -> String {
+    format!("{prefix}trainer-mesh-request:{model_name}:{request_key}")
 }
 
-fn version_key(version_id: &str) -> String {
-    format!("mx:refit:version:metadata:{version_id}")
+fn version_key(prefix: &str, version_id: &str) -> String {
+    format!("{prefix}version:metadata:{version_id}")
 }
 
-fn shards_key(version_id: &str) -> String {
-    format!("mx:refit:version:shards:{version_id}")
+fn shards_key(prefix: &str, version_id: &str) -> String {
+    format!("{prefix}version:shards:{version_id}")
 }
 
 fn publication_key(worker_id: &str, logical_shard_id: &str) -> String {
     format!("{}:{worker_id}{logical_shard_id}", worker_id.len())
 }
 
-fn publication_endpoints_key(version_id: &str) -> String {
-    format!("mx:refit:version:publication-endpoints:{version_id}")
+fn publication_endpoints_key(prefix: &str, version_id: &str) -> String {
+    format!("{prefix}version:publication-endpoints:{version_id}")
 }
 
-fn worker_key(worker_id: &str) -> String {
-    format!("mx:refit:worker:{worker_id}")
+fn worker_key(prefix: &str, worker_id: &str) -> String {
+    format!("{prefix}worker:{worker_id}")
 }
 
-fn leases_key(version_id: &str) -> String {
-    format!("mx:refit:version:leases:{version_id}")
+fn leases_key(prefix: &str, version_id: &str) -> String {
+    format!("{prefix}version:leases:{version_id}")
 }
 
-fn lease_key(version_id: &str, lease_id: &str) -> String {
-    format!("mx:refit:version:lease:{version_id}:{lease_id}")
+fn lease_key(prefix: &str, version_id: &str, lease_id: &str) -> String {
+    format!("{prefix}version:lease:{version_id}:{lease_id}")
 }
 
-fn idempotency_key(model_name: &str, request_key: &str) -> String {
-    format!("mx:refit:version-request:{model_name}:{request_key}")
+fn idempotency_key(prefix: &str, model_name: &str, request_key: &str) -> String {
+    format!("{prefix}version-request:{model_name}:{request_key}")
+}
+
+fn version_key_prefix(prefix: &str) -> String {
+    format!("{prefix}version:")
+}
+
+fn worker_key_prefix(prefix: &str) -> String {
+    format!("{prefix}worker:")
 }
 
 fn lease_id(version_id: &str, worker_id: &str) -> RefitResult<String> {
@@ -229,20 +251,40 @@ fn lease_from_hash(fields: HashMap<String, String>) -> RefitResult<VersionLease>
 
 #[derive(Clone)]
 pub struct RedisRefitBackend {
-    redis: ConnectionManager,
+    redis: RedisConnection,
+    prefix: &'static str,
 }
 
 impl RedisRefitBackend {
+    /// Connects to a standalone Redis instance.
     pub async fn connect(redis_url: &str) -> RefitResult<Self> {
-        let client = redis::Client::open(redis_url).map_err(redis_error)?;
-        let redis = ConnectionManager::new(client).await.map_err(redis_error)?;
-        Ok(Self { redis })
+        Self::connect_endpoint(&RedisEndpointConfig::Standalone(redis_url.to_string())).await
+    }
+
+    /// Connects to a Redis Cluster using the configured seed URLs.
+    pub async fn connect_cluster(redis_urls: &[String]) -> RefitResult<Self> {
+        Self::connect_endpoint(&RedisEndpointConfig::Cluster(redis_urls.to_vec())).await
+    }
+
+    async fn connect_endpoint(endpoint: &RedisEndpointConfig) -> RefitResult<Self> {
+        let redis = endpoint
+            .connect()
+            .await
+            .map_err(RefitBackendError::Unavailable)?;
+        let prefix = if redis.is_cluster() {
+            CLUSTER_PREFIX
+        } else {
+            STANDALONE_PREFIX
+        };
+        Ok(Self { redis, prefix })
     }
 
     async fn get_version_fields(&self, uid: &str) -> RefitResult<HashMap<String, String>> {
         let mut redis = self.redis.clone();
-        let fields: HashMap<String, String> =
-            redis.hgetall(version_key(uid)).await.map_err(redis_error)?;
+        let fields: HashMap<String, String> = redis
+            .hgetall(version_key(self.prefix, uid))
+            .await
+            .map_err(redis_error)?;
         if fields.is_empty() {
             return Err(RefitBackendError::NotFound(format!(
                 "weight version UID {uid:?} was not found"
@@ -258,7 +300,7 @@ impl RedisRefitBackend {
     ) -> RefitResult<WeightVersion> {
         let mut redis = self.redis.clone();
         let result: String = Script::new(UPDATE_VERSION_STATE_LUA)
-            .key(version_key(uid))
+            .key(version_key(self.prefix, uid))
             .arg(state)
             .arg(i32::from(WeightVersionState::Staging))
             .arg(i32::from(WeightVersionState::Ready))
@@ -283,7 +325,7 @@ impl RedisRefitBackend {
     async fn get_lease(&self, version_id: &str, lease_id: &str) -> RefitResult<VersionLease> {
         let mut redis = self.redis.clone();
         let fields: HashMap<String, String> = redis
-            .hgetall(lease_key(version_id, lease_id))
+            .hgetall(lease_key(self.prefix, version_id, lease_id))
             .await
             .map_err(redis_error)?;
         if fields.is_empty() {
@@ -302,15 +344,18 @@ impl RedisRefitBackend {
         let script = Script::new(CREATE_VERSION_LUA);
         let mut invocation = script.prepare_invoke();
         invocation
-            .key(version_key(uid))
+            .key(version_key(self.prefix, uid))
             .key(idempotency_key(
+                self.prefix,
                 &request.model_name,
                 &request.idempotency_key,
             ))
             .key(mesh_key(
+                self.prefix,
                 request.trainer_mesh_id.as_deref().unwrap_or_default(),
             ))
             .key(mesh_versions_key(
+                self.prefix,
                 request.trainer_mesh_id.as_deref().unwrap_or_default(),
             ))
             .arg(uid)
@@ -365,14 +410,13 @@ impl RefitBackend for RedisRefitBackend {
         workers: &HashMap<String, TrainerTensorsMetadata>,
     ) -> RefitResult<()> {
         let members: Vec<_> = workers.iter().collect();
-        let mut pipeline = redis::pipe();
-        for (worker_id, _) in &members {
-            pipeline.hgetall(worker_key(worker_id));
-        }
-        let registrations: Vec<HashMap<String, String>> = pipeline
-            .query_async(&mut self.redis.clone())
-            .await
-            .map_err(redis_error)?;
+        let keys: Vec<String> = members
+            .iter()
+            .map(|(worker_id, _)| worker_key(self.prefix, worker_id))
+            .collect();
+        let mut redis = self.redis.clone();
+        let registrations: Vec<HashMap<String, String>> =
+            redis.hgetall_many(&keys).await.map_err(redis_error)?;
         let trainer_role = i32::from(WorkerRole::Trainer).to_string();
         for ((worker_id, metadata), registration) in members.into_iter().zip(registrations) {
             if registration.get("worker_id") != Some(worker_id)
@@ -395,6 +439,7 @@ impl RefitBackend for RedisRefitBackend {
         let mut redis = self.redis.clone();
         let existing_id: Option<String> = redis
             .get(mesh_idempotency_key(
+                self.prefix,
                 &request.model_name,
                 &request.idempotency_key,
             ))
@@ -404,7 +449,7 @@ impl RefitBackend for RedisRefitBackend {
             return Ok(None);
         };
         let fields: HashMap<String, String> = redis
-            .hgetall(mesh_key(&existing_id))
+            .hgetall(mesh_key(self.prefix, &existing_id))
             .await
             .map_err(redis_error)?;
         if fields.is_empty() {
@@ -445,8 +490,9 @@ impl RefitBackend for RedisRefitBackend {
             let script = Script::new(CREATE_MESH_LUA);
             let mut invocation = script.prepare_invoke();
             invocation
-                .key(mesh_key(&mesh_id))
+                .key(mesh_key(self.prefix, &mesh_id))
                 .key(mesh_idempotency_key(
+                    self.prefix,
                     &request.model_name,
                     &request.idempotency_key,
                 ))
@@ -456,7 +502,7 @@ impl RefitBackend for RedisRefitBackend {
                 .arg(&workers)
                 .arg(i32::from(WorkerRole::Trainer));
             for worker_id in request.workers.keys() {
-                invocation.key(worker_key(worker_id));
+                invocation.key(worker_key(self.prefix, worker_id));
             }
             let result: String = invocation
                 .invoke_async(&mut redis)
@@ -492,7 +538,7 @@ impl RefitBackend for RedisRefitBackend {
     async fn get_trainer_mesh(&self, mesh_id: &str) -> RefitResult<TrainerMesh> {
         let mut redis = self.redis.clone();
         let fields: HashMap<String, String> = redis
-            .hgetall(mesh_key(mesh_id))
+            .hgetall(mesh_key(self.prefix, mesh_id))
             .await
             .map_err(redis_error)?;
         if fields.is_empty() {
@@ -518,14 +564,15 @@ impl RefitBackend for RedisRefitBackend {
         let script = Script::new(UPDATE_MESH_LUA);
         let mut invocation = script.prepare_invoke();
         invocation
-            .key(mesh_key(mesh_id))
-            .key(mesh_versions_key(mesh_id))
+            .key(mesh_key(self.prefix, mesh_id))
+            .key(mesh_versions_key(self.prefix, mesh_id))
             .arg(expected_generation)
             .arg(mesh_workers_json(&workers)?)
             .arg(&current.model_name)
-            .arg(i32::from(WorkerRole::Trainer));
+            .arg(i32::from(WorkerRole::Trainer))
+            .arg(version_key_prefix(self.prefix));
         for worker_id in workers.keys() {
-            invocation.key(worker_key(worker_id));
+            invocation.key(worker_key(self.prefix, worker_id));
         }
         let mut redis = self.redis.clone();
         let result: String = invocation
@@ -560,9 +607,10 @@ impl RefitBackend for RedisRefitBackend {
     async fn delete_trainer_mesh(&self, mesh_id: &str) -> RefitResult<()> {
         let mut redis = self.redis.clone();
         let result: String = Script::new(DELETE_MESH_LUA)
-            .key(mesh_key(mesh_id))
-            .key(mesh_versions_key(mesh_id))
+            .key(mesh_key(self.prefix, mesh_id))
+            .key(mesh_versions_key(self.prefix, mesh_id))
             .arg(i32::from(WeightVersionState::Releasing))
+            .arg(version_key_prefix(self.prefix))
             .invoke_async(&mut redis)
             .await
             .map_err(redis_error)?;
@@ -587,7 +635,7 @@ impl RefitBackend for RedisRefitBackend {
     ) -> RefitResult<WorkerRegistration> {
         let mut redis = self.redis.clone();
         let result: String = Script::new(REGISTER_WORKER_LUA)
-            .key(worker_key(&worker.worker_id))
+            .key(worker_key(self.prefix, &worker.worker_id))
             .arg(&worker.worker_id)
             .arg(worker.role)
             .arg(&worker.model_name)
@@ -709,42 +757,21 @@ impl RefitBackend for RedisRefitBackend {
         let mut redis = self.redis.clone();
         let keys = if let Some(mesh_id) = trainer_mesh_id {
             let ids: Vec<String> = redis
-                .smembers(mesh_versions_key(mesh_id))
+                .smembers(mesh_versions_key(self.prefix, mesh_id))
                 .await
                 .map_err(redis_error)?;
-            ids.iter().map(|id| version_key(id)).collect::<Vec<_>>()
+            ids.iter()
+                .map(|id| version_key(self.prefix, id))
+                .collect::<Vec<_>>()
         } else {
-            let mut cursor = 0_u64;
-            let mut keys = Vec::new();
-            loop {
-                let (next, batch): (u64, Vec<String>) = redis::cmd("SCAN")
-                    .arg(cursor)
-                    .arg("MATCH")
-                    .arg("mx:refit:version:metadata:*")
-                    .arg("COUNT")
-                    .arg(100)
-                    .query_async(&mut redis)
-                    .await
-                    .map_err(redis_error)?;
-                keys.extend(batch);
-                cursor = next;
-                if cursor == 0 {
-                    break;
-                }
-            }
-            keys
+            let pattern = format!("{}version:metadata:*", self.prefix);
+            redis.scan_match(&pattern, 100).await.map_err(redis_error)?
         };
         if keys.is_empty() {
             return Ok(Vec::new());
         }
-        let mut pipeline = redis::pipe();
-        for key in keys {
-            pipeline.hgetall(key);
-        }
-        let records: Vec<HashMap<String, String>> = pipeline
-            .query_async(&mut redis)
-            .await
-            .map_err(redis_error)?;
+        let records: Vec<HashMap<String, String>> =
+            redis.hgetall_many(&keys).await.map_err(redis_error)?;
         let mut versions = HashMap::new();
         for fields in records {
             if fields.is_empty() {
@@ -796,13 +823,14 @@ impl RefitBackend for RedisRefitBackend {
         let encoded = shard.encode_to_vec();
         let mut redis = self.redis.clone();
         let result: String = Script::new(CREATE_SHARD_LUA)
-            .key(version_key(&shard.version_id))
-            .key(worker_key(&shard.worker_id))
-            .key(shards_key(&shard.version_id))
+            .key(version_key(self.prefix, &shard.version_id))
+            .key(worker_key(self.prefix, &shard.worker_id))
+            .key(shards_key(self.prefix, &shard.version_id))
             .key(mesh_key(
+                self.prefix,
                 version.trainer_mesh_id.as_deref().unwrap_or_default(),
             ))
-            .key(publication_endpoints_key(&shard.version_id))
+            .key(publication_endpoints_key(self.prefix, &shard.version_id))
             .arg(publication_key)
             .arg(encoded)
             .arg(&version.model_name)
@@ -813,6 +841,7 @@ impl RefitBackend for RedisRefitBackend {
             .arg(i32::from(WorkerRole::Trainer))
             .arg(&shard.metadata_endpoint)
             .arg(&shard.stable_metadata_digest)
+            .arg(worker_key_prefix(self.prefix))
             .invoke_async(&mut redis)
             .await
             .map_err(redis_error)?;
@@ -888,7 +917,7 @@ impl RefitBackend for RedisRefitBackend {
         let version = self.get_weight_version(version_id).await?;
         let mut redis = self.redis.clone();
         let encoded: Vec<Vec<u8>> = redis
-            .hvals(shards_key(version_id))
+            .hvals(shards_key(self.prefix, version_id))
             .await
             .map_err(redis_error)?;
         let mut shards = encoded
@@ -910,12 +939,12 @@ impl RefitBackend for RedisRefitBackend {
                 })
             });
             if !shards.is_empty() {
-                let mut registrations = redis::pipe();
-                for shard in &shards {
-                    registrations.hget(worker_key(&shard.worker_id), "refit_endpoint");
-                }
-                let endpoints: Vec<Option<String>> = registrations
-                    .query_async(&mut redis)
+                let keys: Vec<String> = shards
+                    .iter()
+                    .map(|shard| worker_key(self.prefix, &shard.worker_id))
+                    .collect();
+                let endpoints: Vec<Option<String>> = redis
+                    .hget_many(&keys, "refit_endpoint")
                     .await
                     .map_err(redis_error)?;
                 shards = shards
@@ -943,7 +972,10 @@ impl RefitBackend for RedisRefitBackend {
         let publication_key = publication_key(&request.worker_id, &request.logical_shard_id);
         let mut redis = self.redis.clone();
         let encoded: Option<Vec<u8>> = redis
-            .hget(shards_key(&request.version_id), &publication_key)
+            .hget(
+                shards_key(self.prefix, &request.version_id),
+                &publication_key,
+            )
             .await
             .map_err(redis_error)?;
         let encoded = encoded.ok_or_else(|| {
@@ -959,11 +991,11 @@ impl RefitBackend for RedisRefitBackend {
         }
 
         let result: String = Script::new(DELETE_SHARD_LUA)
-            .key(version_key(&request.version_id))
-            .key(worker_key(&request.worker_id))
-            .key(shards_key(&request.version_id))
-            .key(leases_key(&request.version_id))
-            .key(publication_endpoints_key(&request.version_id))
+            .key(version_key(self.prefix, &request.version_id))
+            .key(worker_key(self.prefix, &request.worker_id))
+            .key(shards_key(self.prefix, &request.version_id))
+            .key(leases_key(self.prefix, &request.version_id))
+            .key(publication_endpoints_key(self.prefix, &request.version_id))
             .arg(publication_key)
             .arg(encoded)
             .invoke_async(&mut redis)
@@ -1000,10 +1032,10 @@ impl RefitBackend for RedisRefitBackend {
         let lease_id = lease_id(&request.version_id, &request.worker_id)?;
         let mut redis = self.redis.clone();
         let result: String = Script::new(REGISTER_LEASE_LUA)
-            .key(version_key(&request.version_id))
-            .key(worker_key(&request.worker_id))
-            .key(lease_key(&request.version_id, &lease_id))
-            .key(leases_key(&request.version_id))
+            .key(version_key(self.prefix, &request.version_id))
+            .key(worker_key(self.prefix, &request.worker_id))
+            .key(lease_key(self.prefix, &request.version_id, &lease_id))
+            .key(leases_key(self.prefix, &request.version_id))
             .arg(&lease_id)
             .arg(&request.version_id)
             .arg(&request.worker_id)
@@ -1047,8 +1079,12 @@ impl RefitBackend for RedisRefitBackend {
     async fn delete_version_lease(&self, request: &DeleteVersionLeaseRequest) -> RefitResult<bool> {
         let mut redis = self.redis.clone();
         let result: String = Script::new(DELETE_LEASE_LUA)
-            .key(lease_key(&request.version_id, &request.lease_id))
-            .key(leases_key(&request.version_id))
+            .key(lease_key(
+                self.prefix,
+                &request.version_id,
+                &request.lease_id,
+            ))
+            .key(leases_key(self.prefix, &request.version_id))
             .arg(&request.lease_id)
             .arg(&request.version_id)
             .arg(&request.worker_id)
@@ -1170,10 +1206,63 @@ mod tests {
 
     #[test]
     fn version_ids_cannot_collide_with_derived_keys() {
-        assert_ne!(mesh_key("versions:foo"), mesh_versions_key("foo"));
-        assert_ne!(version_key("foo:shards"), shards_key("foo"));
-        assert_ne!(version_key("foo:leases"), leases_key("foo"));
-        assert_ne!(version_key("foo:lease:bar"), lease_key("foo", "bar"));
+        for prefix in [STANDALONE_PREFIX, CLUSTER_PREFIX] {
+            assert_ne!(
+                mesh_key(prefix, "versions:foo"),
+                mesh_versions_key(prefix, "foo")
+            );
+            assert_ne!(version_key(prefix, "foo:shards"), shards_key(prefix, "foo"));
+            assert_ne!(version_key(prefix, "foo:leases"), leases_key(prefix, "foo"));
+            assert_ne!(
+                version_key(prefix, "foo:lease:bar"),
+                lease_key(prefix, "foo", "bar")
+            );
+        }
+    }
+
+    #[test]
+    fn cluster_keys_share_refit_hash_tag() {
+        let expected_slot = redis::cluster_routing::get_slot(b"{refit}");
+        assert_ne!(
+            expected_slot,
+            redis::cluster_routing::get_slot(b"mx:refit:other"),
+            "hash-tag extraction must distinguish tagged {{refit}} keys from untagged keys"
+        );
+        let keys = [
+            mesh_key(CLUSTER_PREFIX, "mesh-1"),
+            mesh_versions_key(CLUSTER_PREFIX, "mesh-1"),
+            mesh_idempotency_key(CLUSTER_PREFIX, "model/a", "req-1"),
+            mesh_idempotency_key(CLUSTER_PREFIX, "org/{model}", "{req}"),
+            version_key(CLUSTER_PREFIX, "ver-1"),
+            shards_key(CLUSTER_PREFIX, "ver-1"),
+            publication_endpoints_key(CLUSTER_PREFIX, "ver-1"),
+            worker_key(CLUSTER_PREFIX, "worker-1"),
+            worker_key(CLUSTER_PREFIX, "{tricky-worker}"),
+            leases_key(CLUSTER_PREFIX, "ver-1"),
+            lease_key(CLUSTER_PREFIX, "ver-1", "lease-1"),
+            idempotency_key(CLUSTER_PREFIX, "model/a", "req-2"),
+            idempotency_key(CLUSTER_PREFIX, "org/{model}", "{req-2}"),
+            format!("{}metadata:ver-1", version_key_prefix(CLUSTER_PREFIX)),
+            format!("{}shards:ver-1", version_key_prefix(CLUSTER_PREFIX)),
+            format!(
+                "{}publication-endpoints:ver-1",
+                version_key_prefix(CLUSTER_PREFIX)
+            ),
+            format!("{}leases:ver-1", version_key_prefix(CLUSTER_PREFIX)),
+            format!("{}worker-1", worker_key_prefix(CLUSTER_PREFIX)),
+            format!("{}{{tricky-worker}}", worker_key_prefix(CLUSTER_PREFIX)),
+        ];
+        for key in keys {
+            assert!(
+                key.starts_with("mx:{refit}:"),
+                "cluster refit key {key:?} must hash to the {{refit}} slot"
+            );
+            assert_eq!(
+                redis::cluster_routing::get_slot(key.as_bytes()),
+                expected_slot,
+                "cluster refit key {key:?} must compute to the {{refit}} CRC16 slot"
+            );
+        }
     }
 
     #[test]

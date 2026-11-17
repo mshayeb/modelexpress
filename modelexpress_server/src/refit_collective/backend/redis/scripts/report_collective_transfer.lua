@@ -6,7 +6,7 @@
 -- KEYS[4]: participants hash
 -- KEYS[5]: group active-operations set
 -- KEYS[6..]: every lane hash, cleared if the collective fails
--- ARGV: operation_id, group_id, epoch, worker_id, succeeded ('1'/'0'), message
+-- ARGV: operation_id, group_id, epoch, worker_id, succeeded ('1'/'0'), message, worker_key_prefix
 --
 -- The helpers come from common.lua, which redis.rs prepends.
 
@@ -42,8 +42,10 @@ local admitted = false
 local participants = redis.call('HVALS', KEYS[4])
 for i = 1, #participants do
   local worker_id, role, index, joined_epoch = parse_participant(participants[i])
+  -- ARGV[7] is `mx:{refit}:worker:` in cluster mode, sharing the `{refit}`
+  -- hash slot with KEYS[1..].
   if not worker_id or tonumber(joined_epoch) ~= tonumber(ARGV[3])
-      or redis.call('EXISTS', 'mx:refit:worker:' .. worker_id) ~= 1 then
+      or redis.call('EXISTS', ARGV[7] .. worker_id) ~= 1 then
     return 'NOTREADY'
   end
   if worker_id == ARGV[4] then

@@ -4,9 +4,10 @@
 -- KEYS[2]: create-request idempotency key
 -- KEYS[3]: group hash
 -- KEYS[4]: group active-operations set
+-- KEYS[5..]: declared operation hashes matching ARGV[8]
 -- ARGV: operation_id, group_id, version_id, model_name, idempotency_key,
---       state, created_at_unix_ms, operation_key_prefix, idempotency_ttl_secs,
---       expected_epoch
+--       state, created_at_unix_ms, known_op_ids (newline separated),
+--       idempotency_ttl_secs, expected_epoch
 --
 -- Returns:
 --   CREATED
@@ -15,6 +16,9 @@
 --   NOGROUP                   no group exists for this membership
 --   NOTREADY:<epoch>:<state>  the group is not READY at the expected epoch
 --   BUSY:<operation_id>       another operation is still in flight at this epoch
+--   RETRY_ACTIVE_OPS          active/reserved operations changed since snapshot
+--
+-- The shared helpers come from common.lua, which redis.rs prepends.
 --
 -- The idempotency reservation is what makes an orchestrator retry safe: a
 -- create that timed out client-side but committed server-side returns the
@@ -26,9 +30,17 @@
 -- is the fast path that lets an epoch bump find and abort this operation
 -- before that TTL would matter.
 
+local op_key_map = build_op_key_map(ARGV[8], key_range(5, #KEYS))
 local existing = redis.call('GET', KEYS[2])
-if existing then
-  if redis.call('EXISTS', ARGV[8] .. existing) == 1 then
+if existing and existing ~= '' and not op_key_map[existing] then
+  return 'RETRY_ACTIVE_OPS'
+end
+if not active_ops_covered(KEYS[4], op_key_map) then
+  return 'RETRY_ACTIVE_OPS'
+end
+
+if existing and existing ~= '' then
+  if redis.call('EXISTS', op_key_map[existing]) == 1 then
     return 'EXISTING:' .. existing
   end
   -- Recover an orphaned reservation left by partial/manual metadata cleanup.
@@ -61,7 +73,11 @@ end
 -- here belongs to a different request.
 local active = redis.call('SMEMBERS', KEYS[4])
 for i = 1, #active do
-  local fields = redis.call('HMGET', ARGV[8] .. active[i], 'state', 'epoch')
+  local op_key = op_key_map[active[i]]
+  if not op_key then
+    return 'RETRY_ACTIVE_OPS'
+  end
+  local fields = redis.call('HMGET', op_key, 'state', 'epoch')
   local op_state, op_epoch = fields[1], fields[2]
   if (op_state == 'PENDING' or op_state == 'RUNNING')
       and tonumber(op_epoch) == tonumber(epoch) then

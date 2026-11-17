@@ -9,6 +9,7 @@
 -- ARGV[2]: worker_id
 -- ARGV[3]: nccl_unique_id, hex encoded
 -- ARGV[4]: slot_id assigned rank 0 in this lane
+-- ARGV[5]: worker_key_prefix
 --
 -- The helpers come from common.lua, which redis.rs prepends.
 
@@ -26,7 +27,7 @@ local leader_record = redis.call('HGET', KEYS[2], ARGV[4])
 local leader_worker, leader_role, leader_index, joined_epoch =
   parse_participant(leader_record)
 if not leader_worker or leader_worker ~= ARGV[2] or tonumber(joined_epoch) ~= epoch
-    or not registration_matches(leader_worker, leader_role, model_name) then
+    or not registration_matches(leader_worker, leader_role, model_name, ARGV[5]) then
   return 'NOTLEADER'
 end
 
@@ -46,7 +47,7 @@ end
 
 local expected = tonumber(redis.call('HGET', KEYS[1], 'expected_total'))
 local ready = evaluate_readiness(
-  KEYS[1], KEYS[2], KEYS[3], key_range(5, #KEYS), expected, epoch, model_name)
+  KEYS[1], KEYS[2], KEYS[3], key_range(5, #KEYS), expected, epoch, model_name, ARGV[5])
 
 local state = ready and 'READY' or 'FORMING'
 redis.call('HSET', KEYS[1], 'state', state)

@@ -7,7 +7,8 @@
 -- KEYS[4]: trainer mesh hash
 -- KEYS[5]: publication endpoint index, keyed like physical publications
 -- ARGV: publication key, encoded shard, model_name, logical_shard_id, staging_state,
---       ready_state, worker_id, trainer_role, metadata_endpoint, stable_metadata_digest
+--       ready_state, worker_id, trainer_role, metadata_endpoint, stable_metadata_digest,
+--       worker_key_prefix
 --
 -- Returns OK:<state> for a new or byte-identical repeated publication. Other
 -- named results reject missing, incompatible, or conflicting inputs. The
@@ -77,7 +78,9 @@ local present = {}
 local covered = 0
 for worker_id, metadata in pairs(workers) do
   local key = string.len(worker_id) .. ':' .. worker_id .. metadata.logical_shard_id
-  local registration = 'mx:refit:worker:' .. worker_id
+  -- ARGV[11] is `mx:{refit}:worker:` in cluster mode, pinning all undeclared
+  -- worker registrations to the same `{refit}` hash slot as KEYS[1..5].
+  local registration = ARGV[11] .. worker_id
   if redis.call('HEXISTS', KEYS[3], key) == 1
       and redis.call('HGET', KEYS[5], key) == metadata.metadata_endpoint
       and redis.call('HGET', registration, 'refit_endpoint') == metadata.metadata_endpoint

@@ -3,11 +3,11 @@
 
 //! Redis implementation of the collective control-plane backend.
 //!
-//! One group's root hash, participants, digests and lane hashes are mutated
-//! together by a single Lua script, and none of the key helpers below carries a
-//! hash tag. That makes the whole keyspace single-slot: this backend targets
-//! standalone or replicated Redis, not Redis Cluster, where those keys would
-//! land on different slots and every script would fail CROSSSLOT.
+//! One group's root hash, participants, digests, lane hashes, operations, and
+//! worker registrations are mutated together by Lua scripts. Standalone Redis
+//! uses untagged `mx:refitc:` / `mx:refit:` prefixes, while Redis Cluster uses
+//! `mx:{refit}c:` / `mx:{refit}:` so all collective and worker-registration keys
+//! hash to the same `{refit}` slot and never fail `CROSSSLOT`.
 
 use std::collections::HashMap;
 use std::fmt::Write as _;
@@ -24,11 +24,11 @@ use modelexpress_common::grpc::refit_collective::{
     LaneAssignment, LaneKind, PlanSource, PublishGroupBootstrapRequest,
     ReportCollectiveTransferRequest,
 };
-use redis::aio::ConnectionManager;
 use redis::{AsyncCommands, Script};
 use uuid::Uuid;
 
 use super::{CollectiveBackend, CollectiveBackendError, CollectiveResult};
+use crate::redis_conn::{RedisConnection, RedisEndpointConfig};
 use crate::refit_collective::lanes::{Lane, LaneLayout};
 
 // EVAL has no `require`, so the helpers the group scripts share live in one
@@ -45,7 +45,7 @@ macro_rules! with_common_lua {
 
 const JOIN_GROUP_LUA: &str = with_common_lua!("redis/scripts/join_collective_group.lua");
 const PUBLISH_BOOTSTRAP_LUA: &str = with_common_lua!("redis/scripts/publish_group_bootstrap.lua");
-const CREATE_TRANSFER_LUA: &str = include_str!("redis/scripts/create_collective_transfer.lua");
+const CREATE_TRANSFER_LUA: &str = with_common_lua!("redis/scripts/create_collective_transfer.lua");
 const REPORT_TRANSFER_LUA: &str = with_common_lua!("redis/scripts/report_collective_transfer.lua");
 const REFRESH_GROUP_LUA: &str = with_common_lua!("redis/scripts/refresh_collective_group.lua");
 const DELETE_TRANSFER_LUA: &str = include_str!("redis/scripts/delete_collective_transfer.lua");
@@ -63,45 +63,48 @@ static REFRESH_GROUP_SCRIPT: LazyLock<Script> = LazyLock::new(|| Script::new(REF
 static DELETE_TRANSFER_SCRIPT: LazyLock<Script> =
     LazyLock::new(|| Script::new(DELETE_TRANSFER_LUA));
 
-fn group_key(group_id: &str) -> String {
-    format!("mx:refitc:group:{group_id}")
+const STANDALONE_PREFIX: &str = "mx:refitc:";
+const CLUSTER_PREFIX: &str = "mx:{refit}c:";
+const STANDALONE_WORKER_PREFIX: &str = "mx:refit:worker:";
+const CLUSTER_WORKER_PREFIX: &str = "mx:{refit}:worker:";
+
+fn group_key(prefix: &str, group_id: &str) -> String {
+    format!("{prefix}group:{group_id}")
 }
 
-fn participants_key(group_id: &str) -> String {
-    format!("mx:refitc:group:{group_id}:participants")
+fn participants_key(prefix: &str, group_id: &str) -> String {
+    format!("{prefix}group:{group_id}:participants")
 }
 
-fn digests_key(group_id: &str) -> String {
-    format!("mx:refitc:group:{group_id}:digests")
+fn digests_key(prefix: &str, group_id: &str) -> String {
+    format!("{prefix}group:{group_id}:digests")
 }
 
-fn active_ops_key(group_id: &str) -> String {
-    format!("mx:refitc:group:{group_id}:ops")
+fn active_ops_key(prefix: &str, group_id: &str) -> String {
+    format!("{prefix}group:{group_id}:ops")
 }
 
-fn lane_key(group_id: &str, lane_id: u32) -> String {
-    format!("mx:refitc:group:{group_id}:lane:{lane_id}")
+fn lane_key(prefix: &str, group_id: &str, lane_id: u32) -> String {
+    format!("{prefix}group:{group_id}:lane:{lane_id}")
 }
 
-const OPERATION_KEY_PREFIX: &str = "mx:refitc:op:";
-
-fn operation_key(operation_id: &str) -> String {
-    format!("{OPERATION_KEY_PREFIX}{operation_id}")
+fn operation_key(prefix: &str, operation_id: &str) -> String {
+    format!("{prefix}op:{operation_id}")
 }
 
-fn reported_key(operation_id: &str) -> String {
-    format!("mx:refitc:op:{operation_id}:reported")
+fn reported_key(prefix: &str, operation_id: &str) -> String {
+    format!("{prefix}op:{operation_id}:reported")
 }
 
-fn operation_idempotency_key(model_name: &str, request_key: &str) -> String {
+fn operation_idempotency_key(prefix: &str, model_name: &str, request_key: &str) -> String {
     format!(
-        "mx:refitc:op-request:{}:{model_name}{request_key}",
+        "{prefix}op-request:{}:{model_name}{request_key}",
         model_name.len()
     )
 }
 
-fn worker_key(worker_id: &str) -> String {
-    format!("mx:refit:worker:{worker_id}")
+fn worker_key(worker_prefix: &str, worker_id: &str) -> String {
+    format!("{worker_prefix}{worker_id}")
 }
 
 /// Derive a stable group identity from the declared membership.
@@ -362,14 +365,37 @@ fn participant_from_record(slot_id: &str, record: &str) -> CollectiveResult<Coll
 }
 
 pub struct RedisCollectiveBackend {
-    connection: ConnectionManager,
+    connection: RedisConnection,
+    prefix: &'static str,
+    worker_prefix: &'static str,
 }
 
 impl RedisCollectiveBackend {
+    /// Connects to a standalone Redis instance.
     pub async fn connect(url: &str) -> CollectiveResult<Self> {
-        let client = redis::Client::open(url).map_err(redis_error)?;
-        let connection = ConnectionManager::new(client).await.map_err(redis_error)?;
-        Ok(Self { connection })
+        Self::connect_endpoint(&RedisEndpointConfig::Standalone(url.to_string())).await
+    }
+
+    /// Connects to a Redis Cluster using the configured seed URLs.
+    pub async fn connect_cluster(urls: &[String]) -> CollectiveResult<Self> {
+        Self::connect_endpoint(&RedisEndpointConfig::Cluster(urls.to_vec())).await
+    }
+
+    async fn connect_endpoint(endpoint: &RedisEndpointConfig) -> CollectiveResult<Self> {
+        let connection = endpoint
+            .connect()
+            .await
+            .map_err(CollectiveBackendError::Unavailable)?;
+        let (prefix, worker_prefix) = if connection.is_cluster() {
+            (CLUSTER_PREFIX, CLUSTER_WORKER_PREFIX)
+        } else {
+            (STANDALONE_PREFIX, STANDALONE_WORKER_PREFIX)
+        };
+        Ok(Self {
+            connection,
+            prefix,
+            worker_prefix,
+        })
     }
 
     fn layout_for(spec: &CollectiveGroupSpec) -> CollectiveResult<LaneLayout> {
@@ -384,7 +410,7 @@ impl RedisCollectiveBackend {
     async fn read_group_once(&self, group_id: &str) -> CollectiveResult<CollectiveGroup> {
         let mut connection = self.connection.clone();
         let fields: HashMap<String, String> = connection
-            .hgetall(group_key(group_id))
+            .hgetall(group_key(self.prefix, group_id))
             .await
             .map_err(redis_error)?;
         if fields.is_empty() {
@@ -404,7 +430,7 @@ impl RedisCollectiveBackend {
         .map_err(|error| CollectiveBackendError::Internal(error.to_string()))?;
 
         let records: HashMap<String, String> = connection
-            .hgetall(participants_key(group_id))
+            .hgetall(participants_key(self.prefix, group_id))
             .await
             .map_err(redis_error)?;
 
@@ -435,12 +461,13 @@ impl RedisCollectiveBackend {
             participants.sort_by_key(|p| p.rank_in_lane);
         }
 
-        let mut lane_pipe = redis::pipe();
-        for lane in layout.lanes() {
-            lane_pipe.hgetall(lane_key(group_id, lane.lane_id));
-        }
-        let lane_hashes: Vec<HashMap<String, String>> = lane_pipe
-            .query_async(&mut connection)
+        let lane_keys: Vec<String> = layout
+            .lanes()
+            .iter()
+            .map(|lane| lane_key(self.prefix, group_id, lane.lane_id))
+            .collect();
+        let lane_hashes: Vec<HashMap<String, String>> = connection
+            .hgetall_many(&lane_keys)
             .await
             .map_err(redis_error)?;
 
@@ -477,7 +504,7 @@ impl RedisCollectiveBackend {
         // FORMING that never resolves.
         let group_digest = field(&fields, "plan_digest")?.to_string();
         let reported: HashMap<String, String> = connection
-            .hgetall(digests_key(group_id))
+            .hgetall(digests_key(self.prefix, group_id))
             .await
             .map_err(redis_error)?;
         let mut disagreeing_slots: Vec<String> = reported
@@ -513,10 +540,35 @@ impl RedisCollectiveBackend {
         })
     }
 
+    async fn snapshot_op_ids(
+        &self,
+        group_id: &str,
+        idempotency_key: Option<&str>,
+    ) -> CollectiveResult<Vec<String>> {
+        let mut connection = self.connection.clone();
+        let mut op_ids: Vec<String> = connection
+            .smembers(active_ops_key(self.prefix, group_id))
+            .await
+            .map_err(redis_error)?;
+        if let Some(idem_key) = idempotency_key
+            && let Some(existing) = connection
+                .get::<_, Option<String>>(idem_key)
+                .await
+                .map_err(redis_error)?
+            && !existing.is_empty()
+        {
+            op_ids.push(existing);
+        }
+        op_ids.retain(|id| !id.is_empty());
+        op_ids.sort();
+        op_ids.dedup();
+        Ok(op_ids)
+    }
+
     async fn refresh_group_state(&self, group_id: &str) -> CollectiveResult<()> {
         let mut connection = self.connection.clone();
         let stored: Option<String> = connection
-            .hget(group_key(group_id), "lanes")
+            .hget(group_key(self.prefix, group_id), "lanes")
             .await
             .map_err(redis_error)?;
         let Some(stored) = stored else {
@@ -526,19 +578,36 @@ impl RedisCollectiveBackend {
         };
         let lanes = decode_lanes(&stored)?;
 
-        let mut script = REFRESH_GROUP_SCRIPT.prepare_invoke();
-        script.key(group_key(group_id));
-        script.key(participants_key(group_id));
-        script.key(digests_key(group_id));
-        script.key(active_ops_key(group_id));
-        for lane in &lanes {
-            script.key(lane_key(group_id, lane.lane_id));
+        let mut outcome = String::new();
+        for _ in 0..5 {
+            let active_op_ids = self.snapshot_op_ids(group_id, None).await?;
+            let mut script = REFRESH_GROUP_SCRIPT.prepare_invoke();
+            script.key(group_key(self.prefix, group_id));
+            script.key(participants_key(self.prefix, group_id));
+            script.key(digests_key(self.prefix, group_id));
+            script.key(active_ops_key(self.prefix, group_id));
+            for lane in &lanes {
+                script.key(lane_key(self.prefix, group_id, lane.lane_id));
+            }
+            for op_id in &active_op_ids {
+                script.key(operation_key(self.prefix, op_id));
+            }
+            outcome = script
+                .arg(lanes.len())
+                .arg(active_op_ids.join("\n"))
+                .arg(self.worker_prefix)
+                .invoke_async(&mut connection)
+                .await
+                .map_err(redis_error)?;
+            if outcome != "RETRY_ACTIVE_OPS" {
+                break;
+            }
         }
-        let outcome: String = script
-            .arg(OPERATION_KEY_PREFIX)
-            .invoke_async(&mut connection)
-            .await
-            .map_err(redis_error)?;
+        if outcome == "RETRY_ACTIVE_OPS" {
+            return Err(CollectiveBackendError::Unavailable(format!(
+                "collective group {group_id} active operations changed while refreshing"
+            )));
+        }
         if outcome == "NOTFOUND" {
             return Err(CollectiveBackendError::NotFound(format!(
                 "collective group {group_id} was not found"
@@ -561,7 +630,7 @@ impl RedisCollectiveBackend {
             let group = self.read_group_once(group_id).await?;
             let mut connection = self.connection.clone();
             let fields: HashMap<String, String> = connection
-                .hgetall(group_key(group_id))
+                .hgetall(group_key(self.prefix, group_id))
                 .await
                 .map_err(redis_error)?;
             if !fields.is_empty()
@@ -579,7 +648,7 @@ impl RedisCollectiveBackend {
     async fn read_transfer(&self, operation_id: &str) -> CollectiveResult<CollectiveTransfer> {
         let mut connection = self.connection.clone();
         let fields: HashMap<String, String> = connection
-            .hgetall(operation_key(operation_id))
+            .hgetall(operation_key(self.prefix, operation_id))
             .await
             .map_err(redis_error)?;
         if fields.is_empty() {
@@ -588,7 +657,7 @@ impl RedisCollectiveBackend {
             )));
         }
         let reported: Vec<String> = connection
-            .smembers(reported_key(operation_id))
+            .smembers(reported_key(self.prefix, operation_id))
             .await
             .map_err(redis_error)?;
 
@@ -624,14 +693,14 @@ impl CollectiveBackend for RedisCollectiveBackend {
 
         let group_id = group_id_for(spec)?;
         let mut keys = vec![
-            group_key(&group_id),
-            participants_key(&group_id),
-            digests_key(&group_id),
-            worker_key(&request.worker_id),
-            active_ops_key(&group_id),
+            group_key(self.prefix, &group_id),
+            participants_key(self.prefix, &group_id),
+            digests_key(self.prefix, &group_id),
+            worker_key(self.worker_prefix, &request.worker_id),
+            active_ops_key(self.prefix, &group_id),
         ];
         for lane in layout.lanes() {
-            keys.push(lane_key(&group_id, lane.lane_id));
+            keys.push(lane_key(self.prefix, &group_id, lane.lane_id));
         }
 
         let role_text = match role {
@@ -647,30 +716,47 @@ impl CollectiveBackend for RedisCollectiveBackend {
         let default_source = PlanSource::default();
         let plan_source = request.plan_source.as_ref().unwrap_or(&default_source);
 
-        let mut script = JOIN_GROUP_SCRIPT.prepare_invoke();
-        for key in &keys {
-            script.key(key);
+        let mut outcome = String::new();
+        for _ in 0..5 {
+            let active_op_ids = self.snapshot_op_ids(&group_id, None).await?;
+            let mut script = JOIN_GROUP_SCRIPT.prepare_invoke();
+            for key in &keys {
+                script.key(key);
+            }
+            for op_id in &active_op_ids {
+                script.key(operation_key(self.prefix, op_id));
+            }
+            outcome = script
+                .arg(&group_id)
+                .arg(&spec.model_name)
+                .arg(encode_lanes(layout.lanes()))
+                .arg(expected_total)
+                .arg(&request.slot_id)
+                .arg(&request.worker_id)
+                .arg(role_text)
+                .arg(request.index_in_role)
+                .arg(&request.plan_digest)
+                .arg(&plan_source.worker_id)
+                .arg(&plan_source.endpoint)
+                .arg(&plan_source.digest)
+                .arg(spec.expected_trainer_slots.join("\n"))
+                .arg(spec.expected_generator_slots.join("\n"))
+                .arg(now_unix_ms()?)
+                .arg(layout.lanes().len())
+                .arg(active_op_ids.join("\n"))
+                .arg(self.worker_prefix)
+                .invoke_async(&mut self.connection.clone())
+                .await
+                .map_err(redis_error)?;
+            if outcome != "RETRY_ACTIVE_OPS" {
+                break;
+            }
         }
-        let outcome: String = script
-            .arg(&group_id)
-            .arg(&spec.model_name)
-            .arg(encode_lanes(layout.lanes()))
-            .arg(expected_total)
-            .arg(&request.slot_id)
-            .arg(&request.worker_id)
-            .arg(role_text)
-            .arg(request.index_in_role)
-            .arg(&request.plan_digest)
-            .arg(&plan_source.worker_id)
-            .arg(&plan_source.endpoint)
-            .arg(&plan_source.digest)
-            .arg(spec.expected_trainer_slots.join("\n"))
-            .arg(spec.expected_generator_slots.join("\n"))
-            .arg(now_unix_ms()?)
-            .arg(OPERATION_KEY_PREFIX)
-            .invoke_async(&mut self.connection.clone())
-            .await
-            .map_err(redis_error)?;
+        if outcome == "RETRY_ACTIVE_OPS" {
+            return Err(CollectiveBackendError::Unavailable(format!(
+                "collective group {group_id} active operations changed while joining"
+            )));
+        }
 
         match outcome.as_str() {
             "UNEXPECTED_SLOT" => {
@@ -783,12 +869,12 @@ impl CollectiveBackend for RedisCollectiveBackend {
             })?;
 
         let mut script = PUBLISH_BOOTSTRAP_SCRIPT.prepare_invoke();
-        script.key(group_key(&request.group_id));
-        script.key(participants_key(&request.group_id));
-        script.key(digests_key(&request.group_id));
-        script.key(lane_key(&request.group_id, request.lane_id));
+        script.key(group_key(self.prefix, &request.group_id));
+        script.key(participants_key(self.prefix, &request.group_id));
+        script.key(digests_key(self.prefix, &request.group_id));
+        script.key(lane_key(self.prefix, &request.group_id, request.lane_id));
         for lane in &group.lanes {
-            script.key(lane_key(&request.group_id, lane.lane_id));
+            script.key(lane_key(self.prefix, &request.group_id, lane.lane_id));
         }
 
         let outcome: String = script
@@ -796,6 +882,7 @@ impl CollectiveBackend for RedisCollectiveBackend {
             .arg(&request.worker_id)
             .arg(hex_encode(&request.nccl_unique_id))
             .arg(leader_slot)
+            .arg(self.worker_prefix)
             .invoke_async(&mut self.connection.clone())
             .await
             .map_err(redis_error)?;
@@ -854,27 +941,45 @@ impl CollectiveBackend for RedisCollectiveBackend {
             Err(error) => return Err(error),
         }
 
-        let outcome: String = CREATE_TRANSFER_SCRIPT
-            .key(operation_key(&operation_id))
-            .key(operation_idempotency_key(
-                &spec.model_name,
-                &request.idempotency_key,
-            ))
-            .key(group_key(&group_id))
-            .key(active_ops_key(&group_id))
-            .arg(&operation_id)
-            .arg(&group_id)
-            .arg(&request.version_id)
-            .arg(&spec.model_name)
-            .arg(&request.idempotency_key)
-            .arg("PENDING")
-            .arg(now_unix_ms()?)
-            .arg(OPERATION_KEY_PREFIX)
-            .arg(envs::nccl_refit_transfer_timeout_secs())
-            .arg(request.expected_epoch)
-            .invoke_async(&mut self.connection.clone())
-            .await
-            .map_err(redis_error)?;
+        let idempotency_key_str =
+            operation_idempotency_key(self.prefix, &spec.model_name, &request.idempotency_key);
+        let mut outcome = String::new();
+        for _ in 0..5 {
+            let known_op_ids = self
+                .snapshot_op_ids(&group_id, Some(&idempotency_key_str))
+                .await?;
+            let mut script = CREATE_TRANSFER_SCRIPT.prepare_invoke();
+            script
+                .key(operation_key(self.prefix, &operation_id))
+                .key(&idempotency_key_str)
+                .key(group_key(self.prefix, &group_id))
+                .key(active_ops_key(self.prefix, &group_id));
+            for op_id in &known_op_ids {
+                script.key(operation_key(self.prefix, op_id));
+            }
+            outcome = script
+                .arg(&operation_id)
+                .arg(&group_id)
+                .arg(&request.version_id)
+                .arg(&spec.model_name)
+                .arg(&request.idempotency_key)
+                .arg("PENDING")
+                .arg(now_unix_ms()?)
+                .arg(known_op_ids.join("\n"))
+                .arg(envs::nccl_refit_transfer_timeout_secs())
+                .arg(request.expected_epoch)
+                .invoke_async(&mut self.connection.clone())
+                .await
+                .map_err(redis_error)?;
+            if outcome != "RETRY_ACTIVE_OPS" {
+                break;
+            }
+        }
+        if outcome == "RETRY_ACTIVE_OPS" {
+            return Err(CollectiveBackendError::Unavailable(format!(
+                "collective group {group_id} active operations changed while creating transfer"
+            )));
+        }
 
         match outcome.as_str() {
             "CREATED" => self.read_transfer(&operation_id).await,
@@ -942,13 +1047,14 @@ impl CollectiveBackend for RedisCollectiveBackend {
         }
 
         let outcome: String = DELETE_TRANSFER_SCRIPT
-            .key(operation_key(operation_id))
-            .key(reported_key(operation_id))
+            .key(operation_key(self.prefix, operation_id))
+            .key(reported_key(self.prefix, operation_id))
             .key(operation_idempotency_key(
+                self.prefix,
                 &transfer.model_name,
                 &transfer.idempotency_key,
             ))
-            .key(active_ops_key(&transfer.group_id))
+            .key(active_ops_key(self.prefix, &transfer.group_id))
             .arg(operation_id)
             .invoke_async(&mut self.connection.clone())
             .await
@@ -973,13 +1079,13 @@ impl CollectiveBackend for RedisCollectiveBackend {
     ) -> CollectiveResult<CollectiveTransfer> {
         let group = self.read_group(&request.group_id).await?;
         let mut script = REPORT_TRANSFER_SCRIPT.prepare_invoke();
-        script.key(operation_key(&request.operation_id));
-        script.key(reported_key(&request.operation_id));
-        script.key(group_key(&request.group_id));
-        script.key(participants_key(&request.group_id));
-        script.key(active_ops_key(&request.group_id));
+        script.key(operation_key(self.prefix, &request.operation_id));
+        script.key(reported_key(self.prefix, &request.operation_id));
+        script.key(group_key(self.prefix, &request.group_id));
+        script.key(participants_key(self.prefix, &request.group_id));
+        script.key(active_ops_key(self.prefix, &request.group_id));
         for lane in &group.lanes {
-            script.key(lane_key(&request.group_id, lane.lane_id));
+            script.key(lane_key(self.prefix, &request.group_id, lane.lane_id));
         }
         let outcome: String = script
             .arg(&request.operation_id)
@@ -988,6 +1094,7 @@ impl CollectiveBackend for RedisCollectiveBackend {
             .arg(&request.worker_id)
             .arg(i32::from(request.succeeded))
             .arg(&request.message)
+            .arg(self.worker_prefix)
             .invoke_async(&mut self.connection.clone())
             .await
             .map_err(redis_error)?;
@@ -1104,6 +1211,11 @@ mod tests {
                 "publish",
                 PUBLISH_BOOTSTRAP_LUA,
                 include_str!("redis/scripts/publish_group_bootstrap.lua"),
+            ),
+            (
+                "create",
+                CREATE_TRANSFER_LUA,
+                include_str!("redis/scripts/create_collective_transfer.lua"),
             ),
             (
                 "report",
@@ -1299,6 +1411,32 @@ mod tests {
         assert!(decode_lanes("notanumber|1|t0|g0").is_err());
     }
 
+    #[test]
+    fn cluster_collective_keys_share_refit_hash_tag() {
+        assert_eq!(
+            operation_key(STANDALONE_PREFIX, "op-1"),
+            "mx:refitc:op:op-1"
+        );
+        assert_eq!(operation_key(CLUSTER_PREFIX, "op-1"), "mx:{refit}c:op:op-1");
+        let keys = [
+            group_key(CLUSTER_PREFIX, "grp-1"),
+            participants_key(CLUSTER_PREFIX, "grp-1"),
+            digests_key(CLUSTER_PREFIX, "grp-1"),
+            active_ops_key(CLUSTER_PREFIX, "grp-1"),
+            lane_key(CLUSTER_PREFIX, "grp-1", 0),
+            operation_key(CLUSTER_PREFIX, "op-1"),
+            reported_key(CLUSTER_PREFIX, "op-1"),
+            operation_idempotency_key(CLUSTER_PREFIX, "model/a", "req-1"),
+            worker_key(CLUSTER_WORKER_PREFIX, "worker-1"),
+        ];
+        for key in keys {
+            assert!(
+                key.starts_with("mx:{refit}"),
+                "cluster collective key {key:?} must hash to the {{refit}} slot"
+            );
+        }
+    }
+
     #[tokio::test]
     #[ignore = "requires Redis at MX_TEST_REDIS_URL"]
     async fn forming_group_with_an_active_operation_refreshes() {
@@ -1315,7 +1453,7 @@ mod tests {
         let mut connection = backend.connection.clone();
         let () = connection
             .hset_multiple(
-                worker_key(&worker_id),
+                worker_key(backend.worker_prefix, &worker_id),
                 &[
                     ("worker_id", worker_id.as_str()),
                     ("role", "1"),
@@ -1325,7 +1463,7 @@ mod tests {
             .await
             .expect("register worker");
         let () = connection
-            .expire(worker_key(&worker_id), 60)
+            .expire(worker_key(backend.worker_prefix, &worker_id), 60)
             .await
             .expect("expire registration");
 
@@ -1350,7 +1488,7 @@ mod tests {
         let operation_id = Uuid::new_v4().simple().to_string();
         let () = connection
             .hset_multiple(
-                operation_key(&operation_id),
+                operation_key(backend.prefix, &operation_id),
                 &[
                     ("operation_id", operation_id.as_str()),
                     ("group_id", group_id.as_str()),
@@ -1361,11 +1499,11 @@ mod tests {
             .await
             .expect("seed operation");
         let () = connection
-            .sadd(active_ops_key(&group_id), &operation_id)
+            .sadd(active_ops_key(backend.prefix, &group_id), &operation_id)
             .await
             .expect("seed active operation");
         let active: u64 = connection
-            .scard(active_ops_key(&group_id))
+            .scard(active_ops_key(backend.prefix, &group_id))
             .await
             .expect("scard");
         assert_eq!(active, 1, "the transfer must be tracked as active");
@@ -1402,7 +1540,7 @@ mod tests {
         let mut connection = backend.connection.clone();
         let () = connection
             .hset_multiple(
-                operation_key(&operation_id),
+                operation_key(backend.prefix, &operation_id),
                 &[
                     ("operation_id", operation_id.as_str()),
                     ("group_id", group_id.as_str()),
@@ -1413,12 +1551,12 @@ mod tests {
             .await
             .expect("seed operation");
         let () = connection
-            .sadd(active_ops_key(&group_id), &operation_id)
+            .sadd(active_ops_key(backend.prefix, &group_id), &operation_id)
             .await
             .expect("seed active operation");
 
         let () = connection
-            .del(group_key(&group_id))
+            .del(group_key(backend.prefix, &group_id))
             .await
             .expect("evict root hash");
         join(
@@ -1434,12 +1572,12 @@ mod tests {
         let group = backend.get_group(&group_id).await.expect("get group");
         assert_eq!(group.epoch, 1, "the recreated group starts over at epoch 1");
         let state: String = connection
-            .hget(operation_key(&operation_id), "state")
+            .hget(operation_key(backend.prefix, &operation_id), "state")
             .await
             .expect("operation state");
         assert_eq!(state, "ABORTED");
         let active: u64 = connection
-            .scard(active_ops_key(&group_id))
+            .scard(active_ops_key(backend.prefix, &group_id))
             .await
             .expect("scard");
         assert_eq!(active, 0, "the old incarnation's operation is not active");
@@ -1459,7 +1597,7 @@ mod tests {
         let mut connection = backend.connection.clone();
         let () = connection
             .hset_multiple(
-                worker_key(worker_id),
+                worker_key(backend.worker_prefix, worker_id),
                 &[
                     ("worker_id", worker_id),
                     ("role", role_code),
@@ -1469,7 +1607,7 @@ mod tests {
             .await
             .expect("register worker");
         let () = connection
-            .expire(worker_key(worker_id), 60)
+            .expire(worker_key(backend.worker_prefix, worker_id), 60)
             .await
             .expect("expire registration");
     }
@@ -1637,12 +1775,19 @@ mod tests {
     ) {
         let mut connection = backend.connection.clone();
         let active: u64 = connection
-            .scard(active_ops_key(&group_id_for(group_spec).expect("group id")))
+            .scard(active_ops_key(
+                backend.prefix,
+                &group_id_for(group_spec).expect("group id"),
+            ))
             .await
             .expect("scard");
         assert_eq!(active, 0, "a refused create must not leave an operation");
         let reserved: bool = connection
-            .exists(operation_idempotency_key(&group_spec.model_name, key))
+            .exists(operation_idempotency_key(
+                backend.prefix,
+                &group_spec.model_name,
+                key,
+            ))
             .await
             .expect("exists");
         assert!(!reserved, "a refused create must not leave a reservation");
@@ -1712,6 +1857,36 @@ mod tests {
         assert_eq!(created.epoch, 1);
     }
 
+    #[test]
+    fn cluster_keys_and_argv_prefixes_share_refit_crc16_slot() {
+        let expected_slot = redis::cluster_routing::get_slot(b"{refit}");
+        assert_ne!(
+            expected_slot,
+            redis::cluster_routing::get_slot(b"mx:refitc:other"),
+            "hash-tag extraction must distinguish tagged {{refit}} keys from untagged keys"
+        );
+        let keys = [
+            group_key(CLUSTER_PREFIX, "grp-1"),
+            participants_key(CLUSTER_PREFIX, "grp-1"),
+            digests_key(CLUSTER_PREFIX, "grp-1"),
+            active_ops_key(CLUSTER_PREFIX, "grp-1"),
+            lane_key(CLUSTER_PREFIX, "grp-1", 0),
+            operation_key(CLUSTER_PREFIX, "op-1"),
+            reported_key(CLUSTER_PREFIX, "op-1"),
+            operation_idempotency_key(CLUSTER_PREFIX, "model/a", "req-1"),
+            operation_idempotency_key(CLUSTER_PREFIX, "org/{model}", "{req}"),
+            worker_key(CLUSTER_WORKER_PREFIX, "worker-1"),
+            worker_key(CLUSTER_WORKER_PREFIX, "{tricky-worker}"),
+        ];
+        for key in keys {
+            assert_eq!(
+                redis::cluster_routing::get_slot(key.as_bytes()),
+                expected_slot,
+                "cluster collective key {key:?} must compute to the {{refit}} CRC16 slot"
+            );
+        }
+    }
+
     #[tokio::test]
     #[ignore = "requires Redis at MX_TEST_REDIS_URL"]
     async fn one_transfer_in_flight_per_group_epoch() {
@@ -1757,7 +1932,11 @@ mod tests {
         // Once the winner is terminal the epoch is free again.
         let mut connection = backend.connection.clone();
         let () = connection
-            .hset(operation_key(&winner.operation_id), "state", "COMPLETE")
+            .hset(
+                operation_key(backend.prefix, &winner.operation_id),
+                "state",
+                "COMPLETE",
+            )
             .await
             .expect("mark complete");
         backend
