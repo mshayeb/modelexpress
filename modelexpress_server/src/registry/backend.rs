@@ -159,8 +159,10 @@ pub async fn create_registry_backend(
             backend.connect().await?;
             Ok(Arc::new(backend) as Arc<dyn RegistryBackend>)
         }
-        BackendConfig::RedisCluster { .. } => {
-            Err("redis-cluster backend is not yet supported for the model registry".into())
+        BackendConfig::RedisCluster { urls } => {
+            let backend = redis::RedisRegistryBackend::new_cluster(&urls);
+            backend.connect().await?;
+            Ok(Arc::new(backend) as Arc<dyn RegistryBackend>)
         }
         BackendConfig::Kubernetes { namespace } => {
             let backend = kubernetes::KubernetesRegistryBackend::new(&namespace).await?;
@@ -173,5 +175,20 @@ pub async fn create_registry_backend(
             backend.connect().await?;
             Ok(Arc::new(backend) as Arc<dyn RegistryBackend>)
         }
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::expect_used)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn create_registry_backend_rejects_empty_redis_cluster_urls() {
+        let err = create_registry_backend(BackendConfig::RedisCluster { urls: Vec::new() })
+            .await
+            .err()
+            .expect("empty cluster seeds must error");
+        assert!(err.to_string().contains("at least one seed URL"), "{err}");
     }
 }

@@ -3,24 +3,24 @@
 
 //! Redis backend for the model registry.
 //!
-//! One Redis Hash per cached model at `mx:model:{provider}:{model_name}`, fields
-//! `provider`, `status`, `created_at`, `last_used_at`, optional `message`. The provider is
-//! in the key so the same name under different providers stays distinct (a `gs://` GCS
-//! object can't satisfy a HuggingFace claim). LRU/status tallies use `SCAN` + pipelined
-//! reads.
+//! One Redis Hash per cached model at `mx:model:{provider}:{model_name}` (standalone) or
+//! `mx:model:{provider}:{m:{model_name}}` (cluster, pinning all candidate keys for the same
+//! `model_name` onto one hash slot while sharding across models). Hash fields: `provider`,
+//! `status`, `created_at`, `last_used_at`, optional `message`. The provider is in the key so
+//! the same name under different providers stays distinct (a `gs://` GCS object can't satisfy
+//! a HuggingFace claim). LRU/status tallies use `SCAN` (across every primary in cluster mode)
+//! + batched reads.
 //!
-//! Pre-0.5.0 records live at the legacy name-only key `mx:model:{model_name}`; they are
-//! migrated lazily on claim (see [`CLAIM_LUA`]) and read transparently meanwhile.
-//!
-//! Mutations run as single atomic EVALs. Multi-key EVALs (e.g. the claim's RENAME) assume
-//! a single Redis instance (`ConnectionManager`, not a cluster) so all keys share a slot.
+//! Pre-0.5.0 records live at the legacy name-only key (`mx:model:{model_name}` or
+//! `mx:model:{m:{model_name}}` in cluster); they are migrated lazily on claim (see [`CLAIM_LUA`])
+//! and read transparently meanwhile.
 
 use super::{ClaimOutcome, ModelRecord, RegistryBackend, RegistryResult};
+use crate::redis_conn::{RedisConnection, RedisEndpointConfig};
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use modelexpress_common::models::{ModelProvider, ModelStatus};
 use redis::AsyncCommands;
-use redis::aio::ConnectionManager;
 use std::sync::Arc;
 use tokio::sync::RwLock;
 use tracing::info;
@@ -46,25 +46,38 @@ const ALL_PROVIDERS: [ModelProvider; 4] = [
     ModelProvider::S3,
 ];
 
-/// Provider-scoped key: `mx:model:{Provider}:{model_name}`.
-fn model_key(provider: ModelProvider, model_name: &str) -> String {
-    format!("{KEY_PREFIX}{}:{model_name}", provider_str(provider))
+/// Provider-scoped key:
+/// - Standalone: `mx:model:{Provider}:{model_name}`
+/// - Cluster:    `mx:model:{Provider}:{m:{model_name}}`
+fn model_key(provider: ModelProvider, model_name: &str, is_cluster: bool) -> String {
+    if is_cluster {
+        format!("{KEY_PREFIX}{}:{{m:{model_name}}}", provider_str(provider))
+    } else {
+        format!("{KEY_PREFIX}{}:{model_name}", provider_str(provider))
+    }
 }
 
 /// Legacy name-only key, pre-provider-scoped keys.
+/// - Standalone: `mx:model:{model_name}`
+/// - Cluster:    `mx:model:{m:{model_name}}`
+///
 /// TODO(0.5.0 migration): remove once no deployment has pre-0.5.0 keys; see [`CLAIM_LUA`].
-fn legacy_model_key(model_name: &str) -> String {
-    format!("{KEY_PREFIX}{model_name}")
+fn legacy_model_key(model_name: &str, is_cluster: bool) -> String {
+    if is_cluster {
+        format!("{KEY_PREFIX}{{m:{model_name}}}")
+    } else {
+        format!("{KEY_PREFIX}{model_name}")
+    }
 }
 
 /// Keys a record for `model_name` may live under when the provider isn't known up front
 /// (status/eviction/deletion): one per provider plus the legacy key. Fixed fan-out, no SCAN.
-fn candidate_keys(model_name: &str) -> Vec<String> {
+fn candidate_keys(model_name: &str, is_cluster: bool) -> Vec<String> {
     let mut keys: Vec<String> = ALL_PROVIDERS
         .iter()
-        .map(|p| model_key(*p, model_name))
+        .map(|p| model_key(*p, model_name, is_cluster))
         .collect();
-    keys.push(legacy_model_key(model_name));
+    keys.push(legacy_model_key(model_name, is_cluster));
     keys
 }
 
@@ -114,38 +127,31 @@ fn parse_rfc3339(s: &str, field: &str) -> RegistryResult<DateTime<Utc>> {
         .map_err(|e| format!("invalid RFC3339 in field '{field}' ({s:?}): {e}").into())
 }
 
-/// Redaction helper for logging: strip userinfo (password, and user if present) from a
-/// redis:// URL so secrets don't leak into logs.
-fn redact_url(url: &str) -> String {
-    let Some(scheme_end) = url.find("://") else {
-        return url.to_string();
-    };
-    let head_end = scheme_end.saturating_add(3);
-    let (head, rest) = url.split_at(head_end); // head = "redis://"
-    let Some(at_pos) = rest.find('@') else {
-        return url.to_string(); // no userinfo
-    };
-    let (userinfo, tail) = rest.split_at(at_pos); // tail starts with '@'
-    match userinfo.split_once(':') {
-        Some((user, _pw)) => format!("{head}{user}:***{tail}"),
-        None => format!("{head}***{tail}"), // user only, no password
-    }
-}
-
 pub struct RedisRegistryBackend {
-    redis: Arc<RwLock<Option<ConnectionManager>>>,
-    redis_url: String,
+    redis: Arc<RwLock<Option<RedisConnection>>>,
+    endpoint: RedisEndpointConfig,
 }
 
 impl RedisRegistryBackend {
     pub fn new(redis_url: &str) -> Self {
         Self {
             redis: Arc::new(RwLock::new(None)),
-            redis_url: redis_url.to_string(),
+            endpoint: RedisEndpointConfig::Standalone(redis_url.to_string()),
         }
     }
 
-    async fn get_conn(&self) -> RegistryResult<ConnectionManager> {
+    pub fn new_cluster(redis_urls: &[String]) -> Self {
+        Self {
+            redis: Arc::new(RwLock::new(None)),
+            endpoint: RedisEndpointConfig::Cluster(redis_urls.to_vec()),
+        }
+    }
+
+    fn is_cluster(&self) -> bool {
+        self.endpoint.is_cluster()
+    }
+
+    async fn get_conn(&self) -> RegistryResult<RedisConnection> {
         {
             let guard = self.redis.read().await;
             if let Some(conn) = guard.as_ref() {
@@ -156,59 +162,34 @@ impl RedisRegistryBackend {
         if let Some(conn) = guard.as_ref() {
             return Ok(conn.clone());
         }
-        let client = redis::Client::open(self.redis_url.as_str())?;
-        let conn = ConnectionManager::new(client).await?;
+        let conn = self.endpoint.connect().await?;
         *guard = Some(conn.clone());
         Ok(conn)
     }
 
-    /// Collect every `mx:model:*` key with a paged SCAN, deduplicating as we go.
-    ///
-    /// Redis `SCAN` can legitimately return the same key twice across cursor pages (for
-    /// example when the hash table is resized mid-iteration), so callers that use the
-    /// result length as a count would double-count. The dedup set keeps this honest.
-    async fn scan_all_keys(&self, conn: &mut ConnectionManager) -> RegistryResult<Vec<String>> {
-        use std::collections::HashSet;
-        let mut cursor: u64 = 0;
-        let mut keys: Vec<String> = Vec::new();
-        let mut seen: HashSet<String> = HashSet::new();
-        loop {
-            let (next, batch): (u64, Vec<String>) = redis::cmd("SCAN")
-                .arg(cursor)
-                .arg("MATCH")
-                .arg(SCAN_PATTERN)
-                .arg("COUNT")
-                .arg(SCAN_BATCH)
-                .query_async(conn)
-                .await?;
-            for k in batch {
-                if seen.insert(k.clone()) {
-                    keys.push(k);
-                }
-            }
-            if next == 0 {
-                break;
-            }
-            cursor = next;
-        }
-        Ok(keys)
-    }
-
-    /// Model name from a scanned key, for both `mx:model:{Provider}:{name}` and legacy
-    /// `mx:model:{name}`. A leading known-provider token + `:` is the prefix; else the
-    /// whole remainder is the name. Real names never collide (GCS is `gs://`, HF/NGC
-    /// `org/...`), and the provider is read from the hash field regardless.
-    fn model_name_from_key(key: &str) -> Option<&str> {
+    /// Model name from a scanned key, decoding `{m:...}` hash tags in cluster mode
+    /// while preserving literal names in standalone mode.
+    fn model_name_from_key(key: &str, is_cluster: bool) -> Option<&str> {
         let rest = key.strip_prefix(KEY_PREFIX)?;
-        for p in ALL_PROVIDERS {
-            if let Some(name) = rest
-                .strip_prefix(provider_str(p))
-                .and_then(|r| r.strip_prefix(':'))
+        let raw_name = ALL_PROVIDERS
+            .iter()
+            .find_map(|p| {
+                rest.strip_prefix(provider_str(*p))
+                    .and_then(|r| r.strip_prefix(':'))
+            })
+            .unwrap_or(rest);
+        if is_cluster {
+            if let Some(tagged) = raw_name
+                .strip_prefix("{m:")
+                .and_then(|s| s.strip_suffix('}'))
             {
-                return Some(name);
+                Some(tagged)
+            } else {
+                Some(raw_name)
             }
+        } else {
+            Some(raw_name)
         }
-        Some(rest)
     }
 
     fn record_from_hash(
@@ -237,23 +218,23 @@ impl RedisRegistryBackend {
 #[async_trait]
 impl RegistryBackend for RedisRegistryBackend {
     async fn connect(&self) -> RegistryResult<()> {
-        let client = redis::Client::open(self.redis_url.as_str())?;
-        let conn = ConnectionManager::new(client).await?;
+        let conn = self.endpoint.connect().await?;
         let mut guard = self.redis.write().await;
         *guard = Some(conn);
         info!(
-            "Registry: connected to Redis at {}",
-            redact_url(&self.redis_url)
+            "Registry: connected to {} at {}",
+            self.endpoint.backend_name(),
+            self.endpoint.redacted_display()
         );
         Ok(())
     }
 
     async fn get_status(&self, model_name: &str) -> RegistryResult<Option<ModelStatus>> {
         let mut conn = self.get_conn().await?;
-        // Provider-agnostic: the caller may not know the provider, so HGET every candidate
-        // key in one round-trip and take the first that exists (a name maps to one provider).
+        // Provider-agnostic: all candidate keys share the `{m:<model_name>}` slot in cluster
+        // mode, so a single-slot pipeline works on both standalone and cluster.
         let mut pipe = redis::pipe();
-        for k in candidate_keys(model_name) {
+        for k in candidate_keys(model_name, self.is_cluster()) {
             pipe.hget(k, fields::STATUS);
         }
         let values: Vec<Option<String>> = pipe.query_async(&mut conn).await?;
@@ -265,10 +246,9 @@ impl RegistryBackend for RedisRegistryBackend {
 
     async fn get_model_record(&self, model_name: &str) -> RegistryResult<Option<ModelRecord>> {
         let mut conn = self.get_conn().await?;
-        // Provider-agnostic: how eviction discovers the provider from a bare name. First
-        // non-empty hash wins; its `provider` field is authoritative.
+        // Provider-agnostic: all candidate keys share `{m:<model_name>}` in cluster mode.
         let mut pipe = redis::pipe();
-        for k in candidate_keys(model_name) {
+        for k in candidate_keys(model_name, self.is_cluster()) {
             pipe.hgetall(k);
         }
         let hashes: Vec<Vec<(String, String)>> = pipe.query_async(&mut conn).await?;
@@ -289,7 +269,7 @@ impl RegistryBackend for RedisRegistryBackend {
     ) -> RegistryResult<()> {
         let mut conn = self.get_conn().await?;
         let now = Utc::now().to_rfc3339();
-        let key = model_key(provider, model_name);
+        let key = model_key(provider, model_name, self.is_cluster());
         // A single EVAL so the status/provider/last_used_at/message/created_at updates
         // are atomic: concurrent get_model_record calls see either the pre- or post-
         // update record, never a half-written one (HGETALL never interleaves with the
@@ -316,7 +296,7 @@ impl RegistryBackend for RedisRegistryBackend {
         let now = Utc::now().to_rfc3339();
         // Provider-agnostic: bump last_used_at on whichever candidate key exists. The EVAL
         // gates each HSET on EXISTS so touch never creates a (last_used_at-only) record.
-        let keys = candidate_keys(model_name);
+        let keys = candidate_keys(model_name, self.is_cluster());
         let script = redis::Script::new(TOUCH_LUA);
         let mut invocation = script.prepare_invoke();
         for k in &keys {
@@ -328,8 +308,11 @@ impl RegistryBackend for RedisRegistryBackend {
 
     async fn delete_model(&self, model_name: &str) -> RegistryResult<()> {
         let mut conn = self.get_conn().await?;
-        // Delete every variant (all providers + legacy); DEL ignores absent keys.
-        let _: () = conn.del(candidate_keys(model_name)).await?;
+        // Delete every variant (all providers + legacy); DEL ignores absent keys and all
+        // candidate keys share `{m:<model_name>}` in cluster mode.
+        let _: () = conn
+            .del(candidate_keys(model_name, self.is_cluster()))
+            .await?;
         Ok(())
     }
 
@@ -338,23 +321,18 @@ impl RegistryBackend for RedisRegistryBackend {
         limit: Option<u32>,
     ) -> RegistryResult<Vec<ModelRecord>> {
         let mut conn = self.get_conn().await?;
-        let keys = self.scan_all_keys(&mut conn).await?;
+        let keys = conn.scan_match(SCAN_PATTERN, SCAN_BATCH).await?;
         if keys.is_empty() {
             return Ok(Vec::new());
         }
-        // Pipeline the HGETALLs so we pay one network round-trip for all models.
-        let mut pipe = redis::pipe();
-        for k in &keys {
-            pipe.hgetall(k);
-        }
-        let hashes: Vec<Vec<(String, String)>> = pipe.query_async(&mut conn).await?;
+        let hashes: Vec<Vec<(String, String)>> = conn.hgetall_many(&keys).await?;
         let mut records: Vec<ModelRecord> = Vec::with_capacity(keys.len());
         for (key, pairs) in keys.iter().zip(hashes) {
             if pairs.is_empty() {
                 // Deleted between SCAN and HGETALL; skip defensively.
                 continue;
             }
-            let Some(name) = Self::model_name_from_key(key) else {
+            let Some(name) = Self::model_name_from_key(key, self.is_cluster()) else {
                 continue;
             };
             match Self::record_from_hash(name, pairs) {
@@ -371,15 +349,11 @@ impl RegistryBackend for RedisRegistryBackend {
 
     async fn get_status_counts(&self) -> RegistryResult<(u32, u32, u32)> {
         let mut conn = self.get_conn().await?;
-        let keys = self.scan_all_keys(&mut conn).await?;
+        let keys = conn.scan_match(SCAN_PATTERN, SCAN_BATCH).await?;
         if keys.is_empty() {
             return Ok((0, 0, 0));
         }
-        let mut pipe = redis::pipe();
-        for k in &keys {
-            pipe.hget(k, fields::STATUS);
-        }
-        let statuses: Vec<Option<String>> = pipe.query_async(&mut conn).await?;
+        let statuses = conn.hget_many(&keys, fields::STATUS).await?;
         let mut downloading = 0u32;
         let mut downloaded = 0u32;
         let mut error = 0u32;
@@ -402,8 +376,9 @@ impl RegistryBackend for RedisRegistryBackend {
         lease_duration: std::time::Duration,
     ) -> RegistryResult<ClaimOutcome> {
         let mut conn = self.get_conn().await?;
-        let key = model_key(provider, model_name);
-        let legacy = legacy_model_key(model_name);
+        let is_cluster = self.is_cluster();
+        let key = model_key(provider, model_name, is_cluster);
+        let legacy = legacy_model_key(model_name, is_cluster);
         let now = Utc::now().to_rfc3339();
         // Single atomic EVAL: returns CLAIM_WON_SENTINEL if we created the record,
         // CLAIM_TAKEOVER_SENTINEL if we took over an expired lease, else the existing
@@ -442,7 +417,7 @@ impl RegistryBackend for RedisRegistryBackend {
         let mut conn = self.get_conn().await?;
         // Retry only runs after a claim observed AlreadyExists (which already migrated any
         // legacy record), so the CAS targets the provider-scoped key directly.
-        let key = model_key(provider, model_name);
+        let key = model_key(provider, model_name, self.is_cluster());
         let now = Utc::now().to_rfc3339();
         // Atomic CAS: flip status from ERROR to DOWNLOADING. Returns 1 on win, 0 on
         // miss. Only the winner spawns the retry download.
@@ -468,7 +443,7 @@ impl RegistryBackend for RedisRegistryBackend {
         lease_duration: std::time::Duration,
     ) -> RegistryResult<bool> {
         let mut conn = self.get_conn().await?;
-        let key = model_key(provider, model_name);
+        let key = model_key(provider, model_name, self.is_cluster());
         let now = Utc::now().to_rfc3339();
         let won: i32 = redis::Script::new(REFRESH_CLAIM_LUA)
             .key(&key)
@@ -490,7 +465,7 @@ impl RegistryBackend for RedisRegistryBackend {
         message: Option<String>,
     ) -> RegistryResult<bool> {
         let mut conn = self.get_conn().await?;
-        let key = model_key(provider, model_name);
+        let key = model_key(provider, model_name, self.is_cluster());
         let now = Utc::now().to_rfc3339();
         let (msg_flag, msg_value) = match &message {
             Some(message) => ("1", message.as_str()),
@@ -689,41 +664,86 @@ mod tests {
 
     #[test]
     fn model_key_and_parse() {
-        // Provider-scoped key round-trips through model_name_from_key.
-        let k = model_key(ModelProvider::HuggingFace, "meta-llama/Llama-3.1-70B");
+        // Standalone provider-scoped key round-trips through model_name_from_key.
+        let k = model_key(
+            ModelProvider::HuggingFace,
+            "meta-llama/Llama-3.1-70B",
+            false,
+        );
         assert_eq!(k, "mx:model:HuggingFace:meta-llama/Llama-3.1-70B");
         assert_eq!(
-            RedisRegistryBackend::model_name_from_key(&k),
+            RedisRegistryBackend::model_name_from_key(&k, false),
             Some("meta-llama/Llama-3.1-70B")
         );
 
+        // Standalone preserves literal names shaped like cluster hash tags.
+        let literal_tagged = model_key(ModelProvider::HuggingFace, "{m:foo}", false);
+        assert_eq!(literal_tagged, "mx:model:HuggingFace:{m:foo}");
+        assert_eq!(
+            RedisRegistryBackend::model_name_from_key(&literal_tagged, false),
+            Some("{m:foo}")
+        );
+
         // A GCS gs:// name is not mistaken for the `Gcs` provider segment.
-        let g = model_key(ModelProvider::Gcs, "gs://bucket/org/model/rev");
+        let g = model_key(ModelProvider::Gcs, "gs://bucket/org/model/rev", false);
         assert_eq!(g, "mx:model:Gcs:gs://bucket/org/model/rev");
         assert_eq!(
-            RedisRegistryBackend::model_name_from_key(&g),
+            RedisRegistryBackend::model_name_from_key(&g, false),
             Some("gs://bucket/org/model/rev")
         );
 
         // Legacy name-only keys (no provider segment) parse to the whole remainder.
-        let legacy = legacy_model_key("gs://bucket/org/model/rev");
+        let legacy = legacy_model_key("gs://bucket/org/model/rev", false);
         assert_eq!(legacy, "mx:model:gs://bucket/org/model/rev");
         assert_eq!(
-            RedisRegistryBackend::model_name_from_key(&legacy),
+            RedisRegistryBackend::model_name_from_key(&legacy, false),
             Some("gs://bucket/org/model/rev")
         );
         assert_eq!(
-            RedisRegistryBackend::model_name_from_key("mx:model:meta-llama/Llama-3.1-70B"),
+            RedisRegistryBackend::model_name_from_key("mx:model:meta-llama/Llama-3.1-70B", false),
             Some("meta-llama/Llama-3.1-70B")
         );
     }
 
     #[test]
+    fn cluster_model_keys_share_hash_tag_and_roundtrip_tricky_names() {
+        for name in [
+            "meta-llama/Llama-3.1-70B",
+            "gs://bucket/org/model/rev",
+            "}leading-brace/{nested}:v1",
+            "{m:foo}",
+        ] {
+            let candidates = candidate_keys(name, true);
+            assert_eq!(candidates.len(), ALL_PROVIDERS.len() + 1);
+            let expected_tag = format!("{{m:{name}}}");
+            for key in &candidates {
+                assert!(key.ends_with(&expected_tag), "key={key}");
+                assert_eq!(
+                    RedisRegistryBackend::model_name_from_key(key, true),
+                    Some(name),
+                    "key={key}"
+                );
+            }
+            fn hash_tag(k: &str) -> &str {
+                k.split_once('{')
+                    .and_then(|(_, after_open)| after_open.split_once('}'))
+                    .map_or(k, |(tag, _)| if tag.is_empty() { k } else { tag })
+            }
+            let expected_hash_tag = hash_tag(&candidates[0]);
+            assert!(!expected_hash_tag.is_empty());
+            assert!(
+                candidates.iter().all(|k| hash_tag(k) == expected_hash_tag),
+                "candidates must compute identical hash tags: {candidates:?}"
+            );
+        }
+    }
+
+    #[test]
     fn candidate_keys_cover_all_providers_and_legacy() {
-        let keys = candidate_keys("org/model");
+        let keys = candidate_keys("org/model", false);
         assert_eq!(keys.len(), ALL_PROVIDERS.len() + 1);
         for provider in ALL_PROVIDERS {
-            assert!(keys.contains(&model_key(provider, "org/model")));
+            assert!(keys.contains(&model_key(provider, "org/model", false)));
         }
         assert!(keys.contains(&"mx:model:org/model".to_string())); // legacy
     }
@@ -731,17 +751,18 @@ mod tests {
     #[test]
     fn redact_url_strips_userinfo() {
         assert_eq!(
-            redact_url("redis://user:secret@host:6379"),
-            "redis://user:***@host:6379"
+            crate::redis_conn::redact_url("redis://user:secret@host:6379"),
+            "redis://<redacted>@host:6379"
         );
-        assert_eq!(redact_url("redis://host:6379"), "redis://host:6379");
-        // User-only (no password): redact user too.
         assert_eq!(
-            redact_url("redis://user@host:6379"),
-            "redis://***@host:6379"
+            crate::redis_conn::redact_url("redis://host:6379"),
+            "redis://host:6379"
         );
-        // Non-redis URL or malformed: pass through.
-        assert_eq!(redact_url("not-a-url"), "not-a-url");
+        assert_eq!(
+            crate::redis_conn::redact_url("redis://user@host:6379"),
+            "redis://<redacted>@host:6379"
+        );
+        assert_eq!(crate::redis_conn::redact_url("not-a-url"), "not-a-url");
     }
 
     #[test]

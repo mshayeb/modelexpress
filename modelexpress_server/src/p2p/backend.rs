@@ -457,8 +457,10 @@ pub async fn create_backend(config: BackendConfig) -> MetadataResult<Arc<dyn Met
             backend.connect().await?;
             Ok(Arc::new(backend) as Arc<dyn MetadataBackend>)
         }
-        BackendConfig::RedisCluster { .. } => {
-            Err("redis-cluster backend is not yet supported for P2P metadata".into())
+        BackendConfig::RedisCluster { urls } => {
+            let backend = redis::RedisBackend::new_cluster(&urls);
+            backend.connect().await?;
+            Ok(Arc::new(backend) as Arc<dyn MetadataBackend>)
         }
         BackendConfig::Kubernetes { namespace } => {
             let backend = kubernetes::KubernetesBackend::new(&namespace).await?;
@@ -523,5 +525,12 @@ mod tests {
         assert_eq!(parse_layout_signature(&values), None);
         values.insert("layout_signature".to_string(), "abc123".to_string());
         assert_eq!(parse_layout_signature(&values).as_deref(), Some("abc123"));
+    }
+
+    #[tokio::test]
+    async fn create_backend_rejects_empty_redis_cluster_urls() {
+        let result =
+            super::create_backend(super::BackendConfig::RedisCluster { urls: Vec::new() }).await;
+        assert!(matches!(result, Err(err) if err.to_string().contains("at least one seed URL")));
     }
 }

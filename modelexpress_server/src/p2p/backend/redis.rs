@@ -4,28 +4,29 @@
 //! Redis backend for P2P model metadata storage.
 //!
 //! Storage layout:
-//!   `mx:source:{source_id}`               — Redis Hash; field `__attributes__` stores
-//!                                            JSON-serialized SourceAttributesJson (once
-//!                                            per source); each other field is an worker_id
-//!                                            with an empty-string value (presence marker).
-//!   `mx:source:{source_id}:{worker_id}` — Redis Hash; field = worker_rank (string),
-//!                                            value = JSON-serialized WorkerRecordJson;
-//!                                            field `status:{worker_rank}` = JSON-serialized
-//!                                            WorkerSummaryJson holding the rank's mutable
-//!                                            state, so heartbeats don't rewrite the record.
+//!   Standalone:
+//!     `mx:source:{source_id}`               — Redis Hash; field `__attributes__` stores
+//!                                              JSON-serialized SourceAttributesJson (once
+//!                                              per source); each other field is a worker_id.
+//!     `mx:source:{source_id}:{worker_id}`   — Redis Hash; field = worker_rank (string),
+//!                                              value = JSON-serialized WorkerRecordJson;
+//!                                              field `status:{rank}` = WorkerSummaryJson.
+//!   Cluster:
+//!     `mx:source:{{source_id}}`             — Hash-tagged by `{source_id}` so source index
+//!     `mx:source:{{source_id}}:{worker_id}` — and all worker hashes for a source share one slot.
 //!
-//! Global listing uses SCAN with pattern `mx:source:????????????????` (16-char source IDs)
-//! to enumerate source index keys without a separate secondary index.
+//! Global listing uses `SCAN` with pattern `mx:source:????????????????` (or
+//! `mx:source:{????????????????}` across all cluster primaries) to enumerate source index keys.
 
 use super::{
     ArtifactSourceMetadataRecord, MetadataBackend, MetadataResult, ModelMetadataRecord,
     TensorRecord, WorkerRecord,
 };
+use crate::redis_conn::{RedisConnection, RedisEndpointConfig};
 use async_trait::async_trait;
 use modelexpress_common::grpc::p2p::WorkerMetadata;
 use modelexpress_common::grpc::p2p::{SourceIdentity, SourceStatus};
 use redis::AsyncCommands;
-use redis::aio::ConnectionManager;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -35,8 +36,10 @@ use tracing::{debug, info};
 /// Redis key prefixes and reserved field names
 mod keys {
     pub const SOURCE_PREFIX: &str = "mx:source:";
-    /// SCAN pattern matching source index keys: `mx:source:{16-char-id}`
+    /// SCAN pattern matching standalone source index keys: `mx:source:<16-char-id>`
     pub const SOURCE_SCAN_PATTERN: &str = "mx:source:????????????????";
+    /// SCAN pattern matching cluster source index keys: `mx:source:{<16-char-id>}`
+    pub const SOURCE_CLUSTER_SCAN_PATTERN: &str = "mx:source:{????????????????}";
     /// Reserved hash field in the source index key that stores SourceAttributesJson.
     pub const ATTRIBUTES_FIELD: &str = "__attributes__";
     /// Prefix of the per-rank mutable-state field (`status:{rank}`) rewritten by heartbeats.
@@ -229,7 +232,7 @@ fn status_field(worker_rank: u32) -> String {
 }
 
 async fn update_status_if_fresh(
-    conn: &mut ConnectionManager,
+    conn: &mut RedisConnection,
     worker_key: &str,
     source_key: &str,
     worker_id: &str,
@@ -296,26 +299,42 @@ fn worker_records_match_status(
     })
 }
 
-/// Scan Redis for all keys matching `pattern`, iterating through all SCAN cursors.
-async fn scan_keys(conn: &mut ConnectionManager, pattern: &str) -> MetadataResult<Vec<String>> {
-    let mut all_keys = Vec::new();
-    let mut cursor: u64 = 0;
-    loop {
-        let (next_cursor, batch): (u64, Vec<String>) = redis::cmd("SCAN")
-            .arg(cursor)
-            .arg("MATCH")
-            .arg(pattern)
-            .arg("COUNT")
-            .arg(100)
-            .query_async(conn)
-            .await?;
-        all_keys.extend(batch);
-        cursor = next_cursor;
-        if cursor == 0 {
-            break;
-        }
+fn source_index_key(source_id: &str, is_cluster: bool) -> String {
+    if is_cluster {
+        format!("{}{{{source_id}}}", keys::SOURCE_PREFIX)
+    } else {
+        format!("{}{source_id}", keys::SOURCE_PREFIX)
     }
-    Ok(all_keys)
+}
+
+fn worker_data_key(source_id: &str, worker_id: &str, is_cluster: bool) -> String {
+    if is_cluster {
+        format!("{}{{{source_id}}}:{worker_id}", keys::SOURCE_PREFIX)
+    } else {
+        format!("{}{source_id}:{worker_id}", keys::SOURCE_PREFIX)
+    }
+}
+
+fn source_scan_pattern(is_cluster: bool) -> &'static str {
+    if is_cluster {
+        keys::SOURCE_CLUSTER_SCAN_PATTERN
+    } else {
+        keys::SOURCE_SCAN_PATTERN
+    }
+}
+
+fn source_id_from_index_key(key: &str, is_cluster: bool) -> Option<&str> {
+    let rest = key.strip_prefix(keys::SOURCE_PREFIX)?;
+    let candidate = if is_cluster {
+        rest.strip_prefix('{')?.strip_suffix('}')?
+    } else {
+        rest
+    };
+    if candidate.contains(':') || candidate.is_empty() {
+        None
+    } else {
+        Some(candidate)
+    }
 }
 
 /// Serializable version of TensorRecord for Redis storage
@@ -584,23 +603,47 @@ fn donor_lease_ttl_ms(
     Ok(millis)
 }
 
-/// Redis backend for metadata storage
+/// Redis backend for metadata storage (standalone or cluster)
 pub struct RedisBackend {
-    redis: Arc<RwLock<Option<ConnectionManager>>>,
-    redis_url: String,
+    redis: Arc<RwLock<Option<RedisConnection>>>,
+    endpoint: RedisEndpointConfig,
 }
 
 impl RedisBackend {
-    /// Create a new Redis backend
+    /// Create a new standalone Redis backend
     pub fn new(redis_url: &str) -> Self {
         Self {
             redis: Arc::new(RwLock::new(None)),
-            redis_url: redis_url.to_string(),
+            endpoint: RedisEndpointConfig::Standalone(redis_url.to_string()),
         }
     }
 
+    /// Create a new Redis Cluster backend from one or more seed URLs
+    pub fn new_cluster(redis_urls: &[String]) -> Self {
+        Self {
+            redis: Arc::new(RwLock::new(None)),
+            endpoint: RedisEndpointConfig::Cluster(redis_urls.to_vec()),
+        }
+    }
+
+    fn is_cluster(&self) -> bool {
+        self.endpoint.is_cluster()
+    }
+
+    fn source_key(&self, source_id: &str) -> String {
+        source_index_key(source_id, self.is_cluster())
+    }
+
+    fn worker_key(&self, source_id: &str, worker_id: &str) -> String {
+        worker_data_key(source_id, worker_id, self.is_cluster())
+    }
+
+    fn scan_pattern(&self) -> &'static str {
+        source_scan_pattern(self.is_cluster())
+    }
+
     /// Get a Redis connection, reconnecting if necessary
-    async fn get_conn(&self) -> MetadataResult<ConnectionManager> {
+    async fn get_conn(&self) -> MetadataResult<RedisConnection> {
         // Fast path: read lock
         {
             let guard = self.redis.read().await;
@@ -615,8 +658,7 @@ impl RedisBackend {
             return Ok(conn.clone());
         }
 
-        let client = redis::Client::open(self.redis_url.as_str())?;
-        let conn = ConnectionManager::new(client).await?;
+        let conn = self.endpoint.connect().await?;
         *guard = Some(conn.clone());
         Ok(conn)
     }
@@ -625,29 +667,16 @@ impl RedisBackend {
 #[async_trait]
 impl MetadataBackend for RedisBackend {
     async fn connect(&self) -> MetadataResult<()> {
-        let client = redis::Client::open(self.redis_url.as_str())?;
-        let conn = ConnectionManager::new(client).await?;
+        let conn = self.endpoint.connect().await?;
 
         let mut guard = self.redis.write().await;
         *guard = Some(conn);
 
-        // Redact credentials from URL before logging
-        let safe_url = if self.redis_url.contains('@') {
-            if let Some(at_pos) = self.redis_url.rfind('@') {
-                let prefix = &self.redis_url[..at_pos];
-                let suffix = &self.redis_url[at_pos..];
-                if let Some(colon_pos) = prefix.rfind(':') {
-                    format!("{}:***{}", &prefix[..colon_pos], suffix)
-                } else {
-                    self.redis_url.clone()
-                }
-            } else {
-                self.redis_url.clone()
-            }
-        } else {
-            self.redis_url.clone()
-        };
-        info!("Connected to Redis at {}", safe_url);
+        info!(
+            "Connected to {} at {}",
+            self.endpoint.backend_name(),
+            self.endpoint.redacted_display()
+        );
         Ok(())
     }
 
@@ -716,8 +745,8 @@ impl MetadataBackend for RedisBackend {
     ) -> MetadataResult<()> {
         let source_id = crate::p2p::source_identity::compute_mx_source_id(identity)?;
         let mut conn = self.get_conn().await?;
-        let worker_key = format!("{}{}:{}", keys::SOURCE_PREFIX, source_id, worker_id);
-        let source_key = format!("{}{}", keys::SOURCE_PREFIX, source_id);
+        let worker_key = self.worker_key(&source_id, worker_id);
+        let source_key = self.source_key(&source_id);
 
         let worker_record = WorkerRecord::from(worker);
         let attr_json = serde_json::to_string(&SourceAttributesJson::from(identity))?;
@@ -759,7 +788,7 @@ impl MetadataBackend for RedisBackend {
         worker_id: &str,
     ) -> MetadataResult<Option<ModelMetadataRecord>> {
         let mut conn = self.get_conn().await?;
-        let key = format!("{}{}:{}", keys::SOURCE_PREFIX, source_id, worker_id);
+        let key = self.worker_key(source_id, worker_id);
 
         let fields: std::collections::HashMap<String, String> = conn.hgetall(&key).await?;
         if fields.is_empty() {
@@ -773,7 +802,7 @@ impl MetadataBackend for RedisBackend {
         // Fetch the full SourceAttributesJson from the source index key's
         // __attributes__ field. This carries model_name, framework knobs, and
         // (for v2 RL clients) extra_parameters.
-        let source_key = format!("{}{}", keys::SOURCE_PREFIX, source_id);
+        let source_key = self.source_key(source_id);
         let attr_json: Option<String> = conn.hget(&source_key, keys::ATTRIBUTES_FIELD).await?;
         let (model_name, identity) = source_identity_from_attributes(attr_json.as_deref());
 
@@ -822,21 +851,22 @@ impl MetadataBackend for RedisBackend {
     ) -> MetadataResult<Vec<super::SourceInstanceInfo>> {
         let mut conn = self.get_conn().await?;
 
+        let is_cluster = self.is_cluster();
         // Collect source_ids to query
         let source_ids: Vec<String> = if let Some(sid) = source_id {
             vec![sid]
         } else {
-            scan_keys(&mut conn, keys::SOURCE_SCAN_PATTERN)
+            conn.scan_match(self.scan_pattern(), 100)
                 .await?
                 .into_iter()
-                .map(|k| k[keys::SOURCE_PREFIX.len()..].to_string())
+                .filter_map(|k| source_id_from_index_key(&k, is_cluster).map(ToString::to_string))
                 .collect()
         };
 
         let mut result = Vec::new();
 
         for sid in &source_ids {
-            let source_key = format!("{}{}", keys::SOURCE_PREFIX, sid);
+            let source_key = self.source_key(sid);
             let instance_map: std::collections::HashMap<String, String> =
                 conn.hgetall(&source_key).await?;
 
@@ -857,7 +887,7 @@ impl MetadataBackend for RedisBackend {
                         .map(|summary| summary.worker_rank)
                         .unwrap_or(0)
                 });
-                let worker_key = format!("{}{}:{}", keys::SOURCE_PREFIX, sid, iid);
+                let worker_key = self.worker_key(sid, iid);
                 let fields: std::collections::HashMap<String, String> =
                     conn.hgetall(&worker_key).await?;
                 if fields.is_empty() {
@@ -915,27 +945,24 @@ impl MetadataBackend for RedisBackend {
         limit: Option<usize>,
     ) -> MetadataResult<Vec<super::SourceInstanceInfo>> {
         let mut conn = self.get_conn().await?;
+        let is_cluster = self.is_cluster();
         let source_ids: Vec<String> = if let Some(sid) = source_id {
             vec![sid]
         } else {
-            scan_keys(&mut conn, keys::SOURCE_SCAN_PATTERN)
+            conn.scan_match(self.scan_pattern(), 100)
                 .await?
                 .into_iter()
-                .map(|key| key[keys::SOURCE_PREFIX.len()..].to_string())
+                .filter_map(|key| {
+                    source_id_from_index_key(&key, is_cluster).map(ToString::to_string)
+                })
                 .collect()
         };
         if source_ids.is_empty() {
             return Ok(Vec::new());
         }
 
-        // The legacy implementation paid one Redis round-trip per source and
-        // then one per worker. Pipeline both phases so discovery remains bounded
-        // even when historical training steps have left many source keys.
-        let mut source_pipe = redis::pipe();
-        for sid in &source_ids {
-            source_pipe.hgetall(format!("{}{}", keys::SOURCE_PREFIX, sid));
-        }
-        let source_hashes: Vec<Vec<(String, String)>> = source_pipe.query_async(&mut conn).await?;
+        let source_keys: Vec<String> = source_ids.iter().map(|sid| self.source_key(sid)).collect();
+        let source_hashes: Vec<Vec<(String, String)>> = conn.hgetall_many(&source_keys).await?;
 
         let mut detailed_selected = Vec::new();
         let mut result = Vec::new();
@@ -1018,12 +1045,11 @@ impl MetadataBackend for RedisBackend {
         }
 
         if !detailed_selected.is_empty() {
-            let mut worker_pipe = redis::pipe();
-            for (sid, worker_id, ..) in &detailed_selected {
-                worker_pipe.hgetall(format!("{}{}:{}", keys::SOURCE_PREFIX, sid, worker_id));
-            }
-            let worker_hashes: Vec<Vec<(String, String)>> =
-                worker_pipe.query_async(&mut conn).await?;
+            let worker_keys: Vec<String> = detailed_selected
+                .iter()
+                .map(|(sid, worker_id, ..)| self.worker_key(sid, worker_id))
+                .collect();
+            let worker_hashes: Vec<Vec<(String, String)>> = conn.hgetall_many(&worker_keys).await?;
 
             for (
                 (sid, worker_id, worker_rank, model_name, training_step, layout_signature),
@@ -1086,7 +1112,7 @@ impl MetadataBackend for RedisBackend {
 
     async fn remove_metadata(&self, source_id: &str) -> MetadataResult<()> {
         let mut conn = self.get_conn().await?;
-        let source_key = format!("{}{}", keys::SOURCE_PREFIX, source_id);
+        let source_key = self.source_key(source_id);
 
         let instance_map: std::collections::HashMap<String, String> =
             conn.hgetall(&source_key).await?;
@@ -1096,7 +1122,7 @@ impl MetadataBackend for RedisBackend {
             .keys()
             .filter(|k| k.as_str() != keys::ATTRIBUTES_FIELD)
         {
-            let worker_key = format!("{}{}:{}", keys::SOURCE_PREFIX, source_id, iid);
+            let worker_key = self.worker_key(source_id, iid);
             pipe.del(worker_key);
         }
         pipe.del(&source_key);
@@ -1108,8 +1134,8 @@ impl MetadataBackend for RedisBackend {
 
     async fn remove_worker(&self, source_id: &str, worker_id: &str) -> MetadataResult<()> {
         let mut conn = self.get_conn().await?;
-        let source_key = format!("{}{}", keys::SOURCE_PREFIX, source_id);
-        let worker_key = format!("{}{}:{}", keys::SOURCE_PREFIX, source_id, worker_id);
+        let source_key = self.source_key(source_id);
+        let worker_key = self.worker_key(source_id, worker_id);
 
         let _: usize = redis::Script::new(REMOVE_WORKER_LUA)
             .key(&worker_key)
@@ -1128,12 +1154,24 @@ impl MetadataBackend for RedisBackend {
 
     async fn list_sources(&self) -> MetadataResult<Vec<(String, String)>> {
         let mut conn = self.get_conn().await?;
-        let source_keys = scan_keys(&mut conn, keys::SOURCE_SCAN_PATTERN).await?;
+        let is_cluster = self.is_cluster();
+        let scanned_keys = conn.scan_match(self.scan_pattern(), 100).await?;
+        let indexed_keys: Vec<(String, String)> = scanned_keys
+            .into_iter()
+            .filter_map(|key| {
+                let sid = source_id_from_index_key(&key, is_cluster)?.to_string();
+                Some((sid, key))
+            })
+            .collect();
+        if indexed_keys.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let keys_only: Vec<String> = indexed_keys.iter().map(|(_, k)| k.clone()).collect();
+        let attr_values = conn.hget_many(&keys_only, keys::ATTRIBUTES_FIELD).await?;
 
         let mut sources = Vec::new();
-        for key in source_keys {
-            let source_id = key[keys::SOURCE_PREFIX.len()..].to_string();
-            let attr_json: Option<String> = conn.hget(&key, keys::ATTRIBUTES_FIELD).await?;
+        for ((source_id, _), attr_json) in indexed_keys.into_iter().zip(attr_values) {
             if let Some(json) = attr_json {
                 let model_name = serde_json::from_str::<SourceAttributesJson>(&json)
                     .map(|a| a.model_name)
@@ -1154,7 +1192,7 @@ impl MetadataBackend for RedisBackend {
         source_load: Option<f32>,
     ) -> MetadataResult<()> {
         let mut conn = self.get_conn().await?;
-        let key = format!("{}{}:{}", keys::SOURCE_PREFIX, source_id, worker_id);
+        let key = self.worker_key(source_id, worker_id);
 
         // Heartbeats rewrite only the small `status:{rank}` field, never the record.
         let status_json: Option<String> = conn.hget(&key, status_field(worker_rank)).await?;
@@ -1188,7 +1226,7 @@ impl MetadataBackend for RedisBackend {
             source_load,
             topology,
         })?;
-        let source_key = format!("{}{}", keys::SOURCE_PREFIX, source_id);
+        let source_key = self.source_key(source_id);
         let updated = update_status_if_fresh(
             &mut conn,
             &key,
@@ -1815,5 +1853,25 @@ mod tests {
             .remove_worker(&source_id, &worker_id)
             .await
             .expect("cleanup");
+    }
+
+    #[test]
+    fn cluster_keys_share_source_hash_tag_and_reject_worker_keys() {
+        let sid = "0123456789abcdef";
+        let wid = "worker-42";
+
+        let standalone_src = source_index_key(sid, false);
+        let standalone_wrk = worker_data_key(sid, wid, false);
+        assert_eq!(standalone_src, "mx:source:0123456789abcdef");
+        assert_eq!(standalone_wrk, "mx:source:0123456789abcdef:worker-42");
+        assert_eq!(source_id_from_index_key(&standalone_src, false), Some(sid));
+        assert_eq!(source_id_from_index_key(&standalone_wrk, false), None);
+
+        let cluster_src = source_index_key(sid, true);
+        let cluster_wrk = worker_data_key(sid, wid, true);
+        assert_eq!(cluster_src, "mx:source:{0123456789abcdef}");
+        assert_eq!(cluster_wrk, "mx:source:{0123456789abcdef}:worker-42");
+        assert_eq!(source_id_from_index_key(&cluster_src, true), Some(sid));
+        assert_eq!(source_id_from_index_key(&cluster_wrk, true), None);
     }
 }
