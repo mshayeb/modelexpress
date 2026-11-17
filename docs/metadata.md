@@ -228,7 +228,8 @@ Configured via `MX_METADATA_BACKEND` environment variable:
 
 | Value | Backend | Use Case |
 |-------|---------|----------|
-| `redis` | Redis | Production with Redis |
+| `redis` | Redis | Production with standalone Redis (or Redis Cluster via `MX_REDIS_MODE=cluster`) |
+| `redis-cluster` | Redis Cluster | Sharded multi-primary Redis Cluster (shorthand for `MX_METADATA_BACKEND=redis` + `MX_REDIS_MODE=cluster`) |
 | `kubernetes` / `k8s` / `crd` | Kubernetes CRDs | K8s-native deployments |
 
 ### Redis Backend
@@ -262,8 +263,16 @@ Three types of Redis keys are relevant:
 | `last_used_at` | RFC3339 timestamp | Last status write or cache hit time for LRU eviction |
 | `message` | Optional string | Download progress, retry, or error detail |
 
-Global listing uses `SCAN` with pattern `mx:source:????????????????` (exactly 16 hex chars) to enumerate source index keys without a secondary index.
-Model-cache listing uses `SCAN` with pattern `mx:model:*`; LRU ordering and status counts are computed by pipelined reads and Rust-side sorting/tallying.
+Global listing uses `SCAN` with pattern `mx:source:????????????????` (`mx:source:{????????????????}` across every active primary in cluster mode) to enumerate source index keys without a secondary index.
+Model-cache listing uses `SCAN` with pattern `mx:model:*`; LRU ordering and status counts are computed by batched reads and Rust-side sorting/tallying.
+
+#### Redis Cluster Sharding & Failover Behavior
+
+In Redis Cluster mode, keys are hash-tagged per subsystem according to their access and atomicity requirements:
+
+- **Model Registry (`mx:model:<Provider>:{m:<model_name>}`)** and **P2P Metadata (`mx:source:{<source_id>}` / `mx:source:{<source_id>}:<worker_id>`)** shard horizontally across all cluster primaries by model name or `source_id`, while pinning per-model candidate keys and per-source worker hashes to the same slot so multi-key Lua scripts never hit `CROSSSLOT`.
+- **Refit (`mx:{refit}:*`)** and **Collective Refit (`mx:{refit}c:*`)** intentionally route all keys through a single `{refit}` hash tag on one primary. Refit and Collective Refit RPCs look up meshes, versions, groups, and transfers by opaque ID without `model_name`, and their Lua scripts atomically read/mutate across meshes, versions, leases, collective groups, active operations, and worker registrations (`mx:{refit}:worker:<id>`). Because Refit traffic is low-frequency control-plane coordination rather than tensor data-plane traffic, placing `{refit}` in one slot guarantees script atomicity without introducing a throughput bottleneck.
+- **Failover & Topology Checks**: Cluster `SCAN` discovers active primaries via `CLUSTER SLOTS` and retries with a topology refresh if a primary fails over or slots shift mid-scan. Standalone startup `INFO cluster` fails fast if pointed at a cluster (`cluster_enabled:1`), while logging a warning and falling back to `PING` when restricted ACLs or proxies reject `INFO`.
 
 No Redis TTL is applied to keys. P2P stale detection and cleanup are handled by the server-side reaper (see Source Lifecycle above). Model lifecycle entries are deleted when cache eviction removes a model.
 
@@ -555,12 +564,18 @@ The `backend_type` discriminator is persisted in storage for unambiguous deseria
 
 | Variable | Default | Description |
 |----------|---------|-------------|
-| `MX_METADATA_BACKEND` | (required) | `redis` or `kubernetes` |
+| `MX_METADATA_BACKEND` | (required) | `redis`, `redis-cluster`, or `kubernetes` |
+| `MX_REDIS_MODE` | `standalone` | Redis topology mode when `MX_METADATA_BACKEND=redis`: `standalone` or `cluster` |
 | `MX_SERVER_ADDRESS` | `localhost:8001` | gRPC server address (recommended) |
 | `MODEL_EXPRESS_URL` | `localhost:8001` | Deprecated in favor of `MX_SERVER_ADDRESS`. Still read by all client paths and still takes precedence when both are set, because the TRT-LLM live-transfer integration reads only this name. It is removed once that path reads `MX_SERVER_ADDRESS`; until then set both to the same value. |
-| `MX_REDIS_HOST` / `REDIS_HOST` | (required with port) | Redis host when `REDIS_URL` is not set |
-| `MX_REDIS_PORT` / `REDIS_PORT` | (required with host) | Redis port when `REDIS_URL` is not set |
-| `REDIS_URL` | (required unless host and port are set) | Full Redis URL; overrides host/port |
+| `MX_REDIS_HOST` / `REDIS_HOST` | (required with port) | Redis host (or comma-separated cluster seed hosts) when `MX_REDIS_URL` / `REDIS_URL` is not set |
+| `MX_REDIS_PORT` / `REDIS_PORT` | (required with host) | Redis port when `MX_REDIS_URL` / `REDIS_URL` is not set |
+| `MX_REDIS_URL` / `REDIS_URL` | (required unless host and port are set) | Full Redis URL (or comma-separated cluster seed URLs); overrides host/port (`MX_REDIS_URL` checked first) |
+| `MX_REDIS_CONNECTION_TIMEOUT_MS` | `5000` | Redis Cluster TCP connect timeout in milliseconds |
+| `MX_REDIS_RESPONSE_TIMEOUT_MS` | `10000` | Redis Cluster command response timeout in milliseconds |
+| `MX_REDIS_CLUSTER_RETRIES` | `8` | Maximum Redis Cluster retries on topology/command errors (`0` disables) |
+| `MX_REDIS_CLUSTER_MIN_RETRY_WAIT_MS` | `50` | Initial Redis Cluster retry backoff delay in milliseconds |
+| `MX_REDIS_CLUSTER_MAX_RETRY_WAIT_MS` | `2000` | Maximum Redis Cluster retry backoff delay in milliseconds (clamped `>= min`) |
 | `MX_METADATA_NAMESPACE` / `POD_NAMESPACE` | (required for Kubernetes) | K8s namespace for CRD backend |
 | `MX_HEARTBEAT_INTERVAL_SECS` | `30` | Client heartbeat frequency |
 | `MX_HEARTBEAT_TIMEOUT_SECS` | `90` | Server reaper staleness threshold |
@@ -581,11 +596,27 @@ grpcurl -plaintext -d '{}' <server_host>:8001 model_express.p2p.P2pService/ListS
 ### Inspect Redis state
 
 ```bash
+# Standalone Redis
 redis-cli KEYS "mx:source:*"
 redis-cli HGETALL "mx:source:<source_id>"
 redis-cli HGETALL "mx:source:<source_id>:<worker_id>"
 redis-cli KEYS "mx:model:*"
 redis-cli HGETALL "mx:model:<model_name>"
+
+# Redis Cluster (hash-tagged keys; pass -c to follow MOVED redirects and iterate SCAN to cursor 0 on each primary)
+for node in $(redis-cli -h <seed-host> -p <port> CLUSTER NODES | awk '$3 ~ /master/ && $3 !~ /fail/ { split($2, a, "@"); print a[1] }'); do
+  host="${node%:*}"; port="${node##*:}"; cursor=0
+  while :; do
+    reply=$(redis-cli -h "$host" -p "$port" SCAN "$cursor" MATCH "mx:*" COUNT 500)
+    cursor=$(printf '%s\n' "$reply" | head -n1)
+    printf '%s\n' "$reply" | tail -n +2
+    [ "$cursor" = "0" ] && break
+  done
+done
+redis-cli -c HGETALL "mx:source:{<source_id>}"
+redis-cli -c HGETALL "mx:source:{<source_id>}:<worker_id>"
+redis-cli -c HGETALL "mx:model:<Provider>:{m:<model_name>}"
+# Refit & Collective keys live under mx:{refit}:* and mx:{refit}c:*
 ```
 
 ### Inspect K8s state
@@ -604,6 +635,7 @@ kubectl get configmaps -l modelexpress.nvidia.com/mx-source-id=<source_id> -n <n
 | `GetMetadata` returns `found: false` | Worker was garbage-collected by reaper, or wrong `mx_source_id`/`worker_id` |
 | Target stuck waiting | Source still loading (check source pod logs for progress) |
 | K8s CRs missing | RBAC issue -- check source logs and service account permissions for both `modelmetadatas` and `modelcacheentries` |
-| Stale P2P metadata after redeploy | Reaper marks stale within 90s. For immediate Redis cleanup: delete `mx:source:*` keys or `FLUSHDB` in a dedicated Redis DB |
-| Stale model lifecycle metadata after redeploy | Inspect `mx:model:*` or `modelcacheentries`; delete the stale lifecycle entry if it no longer matches cache contents |
+| Stale P2P metadata after redeploy | Reaper marks stale within 90s. For immediate Redis cleanup: delete `mx:source:*` (standalone) or both `mx:source:{<source_id>}` and `mx:source:{<source_id>}:*` (cluster, scanning all primaries to cursor 0) keys, or `FLUSHDB` in a dedicated Redis DB |
+| Stale model lifecycle metadata after redeploy | Inspect `mx:model:*` (or `mx:model:{m:*}` in cluster mode) or `modelcacheentries`; delete the stale lifecycle entry if it no longer matches cache contents |
+| Redis topology mismatch on startup | Standalone mode rejects `cluster_enabled:1` nodes and cluster mode rejects standalone nodes; set `MX_REDIS_MODE=cluster` or `MX_METADATA_BACKEND=redis-cluster` with comma-separated seed URLs for clusters |
 | Transfer failure with address errors | Source pod restarted, so its GPU addresses are invalid. ModelExpress clears the failed NIXL state, reinitializes a potentially mutated target, and tries the next ranked source within the retry budget. If no source succeeds, the strategy chain continues through server cache, InstantTensor, ModelStreamer, GDS, and the native loader. |

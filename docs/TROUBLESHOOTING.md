@@ -39,7 +39,7 @@ nc -vz localhost 8001
 curl -s http://localhost:9401/metrics | head
 ```
 
-Redis requires `REDIS_URL`, or both host and port settings. Kubernetes requires the CRDs, RBAC, and `POD_NAMESPACE` or `MX_METADATA_NAMESPACE`. Inspect `ModelMetadata` resources or the scoped Redis keys for source state; do not run `FLUSHALL` on shared production Redis.
+Redis requires `MX_REDIS_URL` / `REDIS_URL`, or both host and port settings. For Redis Cluster, set `MX_METADATA_BACKEND=redis-cluster` (or `MX_METADATA_BACKEND=redis` with `MX_REDIS_MODE=cluster`) and pass one or more comma-separated seed URLs in `MX_REDIS_URL` / `REDIS_URL` (startup rejects standalone/cluster topology mismatches immediately). Kubernetes requires the CRDs, RBAC, and `POD_NAMESPACE` or `MX_METADATA_NAMESPACE`. Inspect `ModelMetadata` resources or the scoped Redis keys (`mx:source:{<source_id>}` / `mx:source:{<source_id>}:*` / `mx:model:<Provider>:{m:<model_name>}` / `mx:{refit}:*` / `mx:{refit}c:*` in cluster mode) for source state; do not run `FLUSHALL` on shared production Redis.
 
 ## P2P
 

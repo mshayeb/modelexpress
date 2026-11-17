@@ -36,7 +36,22 @@ export POD_NAMESPACE=modelexpress
 cargo run --bin modelexpress-server
 ~~~
 
-The server accepts redis, kubernetes, k8s, and crd. Redis requires REDIS_URL, or both MX_REDIS_HOST and MX_REDIS_PORT (the older REDIS_HOST and REDIS_PORT names remain aliases). Kubernetes requires POD_NAMESPACE or MX_METADATA_NAMESPACE. There is no production fallback to localhost Redis or the default namespace.
+The server accepts `redis`, `redis-cluster`, `kubernetes`, `k8s`, and `crd`. Standalone Redis (`MX_METADATA_BACKEND=redis` with `MX_REDIS_MODE=standalone`, the default) requires `MX_REDIS_URL` / `REDIS_URL`, or both `MX_REDIS_HOST` and `MX_REDIS_PORT` (the older `REDIS_HOST` and `REDIS_PORT` names remain aliases). Redis Cluster (`MX_METADATA_BACKEND=redis-cluster`, or `MX_METADATA_BACKEND=redis` with `MX_REDIS_MODE=cluster`) accepts one or more comma-separated seed URLs in `MX_REDIS_URL` / `REDIS_URL` or comma-separated hosts in `MX_REDIS_HOST` (paired with `MX_REDIS_PORT` or `REDIS_PORT`). When `MX_METADATA_BACKEND=redis-cluster`, `MX_REDIS_MODE` must be unset or `cluster` (`standalone` is rejected as a conflict). On startup, the server probes Redis topology (`INFO cluster` when permitted, logging a warning and falling back to `PING` if restricted ACLs or proxies reject `INFO`) and fails fast if a standalone backend points at a cluster node or vice versa. In cluster mode, multi-primary `SCAN` queries `CLUSTER SLOTS` and retries on mid-scan primary failovers. Kubernetes requires `POD_NAMESPACE` or `MX_METADATA_NAMESPACE`. There is no production fallback to localhost Redis or the default namespace.
+
+### Redis backend environment variables
+
+| Environment variable | Default | Meaning |
+|---|---|---|
+| `MX_METADATA_BACKEND` | required on server | `redis`, `redis-cluster`, or `kubernetes`/`k8s`/`crd` |
+| `MX_REDIS_MODE` | `standalone` | Topology mode when `MX_METADATA_BACKEND=redis` (`standalone` or `cluster`) |
+| `MX_REDIS_URL` / `REDIS_URL` | unset | Redis URL (or comma-separated cluster seed URLs); overrides host/port |
+| `MX_REDIS_HOST` / `REDIS_HOST` | unset | Redis host (or comma-separated cluster seed hosts) when URL is unset |
+| `MX_REDIS_PORT` / `REDIS_PORT` | unset | Redis port paired with `MX_REDIS_HOST` / `REDIS_HOST` |
+| `MX_REDIS_CONNECTION_TIMEOUT_MS` | `5000` | Redis Cluster TCP connect timeout in milliseconds |
+| `MX_REDIS_RESPONSE_TIMEOUT_MS` | `10000` | Redis Cluster command response timeout in milliseconds |
+| `MX_REDIS_CLUSTER_RETRIES` | `8` | Maximum Redis Cluster client retries on topology/command errors (`0` disables) |
+| `MX_REDIS_CLUSTER_MIN_RETRY_WAIT_MS` | `50` | Initial Redis Cluster retry backoff delay in milliseconds |
+| `MX_REDIS_CLUSTER_MAX_RETRY_WAIT_MS` | `2000` | Maximum Redis Cluster retry backoff delay in milliseconds (clamped to `>= min`) |
 
 ### Server flags and config-file fields
 
@@ -129,7 +144,8 @@ MX_P2P_METADATA=0 only changes the central-coordinator metadata representation; 
 
 | Environment variable | Default | Effect |
 |---|---|---|
-| MX_METADATA_BACKEND | empty on client; required on server | redis, kubernetes/k8s/crd, or client-only k8s-service |
+| `MX_METADATA_BACKEND` | empty on client; required on server | `redis`, `redis-cluster`, `kubernetes`/`k8s`/`crd`, or client-only `k8s-service` |
+| `MX_REDIS_MODE` | `standalone` | Redis topology mode when `MX_METADATA_BACKEND=redis`: `standalone` or `cluster` (when `MX_METADATA_BACKEND=redis-cluster`, leave unset or set to `cluster`) |
 | MX_METADATA_PORT | 5555 | Base NIXL metadata port; worker port is base plus device ID |
 | MX_WORKER_GRPC_PORT | 6555 | Base worker gRPC port for tensor and artifact manifests |
 | MX_WORKER_HOST | auto-detect | Advertised worker host override |

@@ -148,8 +148,9 @@ The following table lists the configurable parameters of the ModelExpress chart 
 | `persistence.mountPath`                      | Mount path                                     | `/root`  |
 | `env.MODEL_EXPRESS_LOG_LEVEL`                | Logging level                                  | `info`   |
 | `env.MODEL_EXPRESS_CACHE_DIRECTORY`          | Cache directory                                | `/root`  |
-| `env.MX_METADATA_BACKEND`                    | Distributed backend (`redis` or `kubernetes`). Server fails to start without this. | `<required>` |
-| `env.REDIS_URL`                              | Redis connection URL; required when backend is `redis`. Chart does not bundle Redis. | `<required when backend=redis>` |
+| `env.MX_METADATA_BACKEND`                    | Distributed backend (`redis`, `redis-cluster`, or `kubernetes`). Server fails to start without this. | `<required>` |
+| `env.MX_REDIS_MODE`                          | Redis topology mode when `MX_METADATA_BACKEND=redis` (`standalone` or `cluster`; defaults to `standalone`). | `standalone` |
+| `env.REDIS_URL`                              | Redis connection URL (or comma-separated cluster seed URLs, or `MX_REDIS_URL`); required when backend is `redis` or `redis-cluster`. Chart does not bundle Redis. | `<required when backend=redis\|redis-cluster>` |
 | `livenessProbe.enabled`                      | Enable liveness probe                          | `true`   |
 | `readinessProbe.enabled`                     | Enable readiness probe                         | `true`   |
 | `nodeSelector`                               | Node selector                                  | `{}`     |

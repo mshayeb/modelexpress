@@ -61,15 +61,20 @@ logging:
 
 ### Starting the Server
 
-The server requires `MX_METADATA_BACKEND` (`redis` or `kubernetes`) plus the connection
+The server requires `MX_METADATA_BACKEND` (`redis`, `redis-cluster`, or `kubernetes`) plus the connection
 env vars for the chosen backend — the server refuses to start without them. See
 [Distributed backend selection](#distributed-backend-selection) below for the full env
 contract.
 
 ```bash
-# Redis backend
+# Standalone Redis backend
 export MX_METADATA_BACKEND=redis
 export REDIS_URL=redis://localhost:6379
+cargo run --bin modelexpress-server
+
+# Redis Cluster backend (equivalent to MX_METADATA_BACKEND=redis + MX_REDIS_MODE=cluster)
+export MX_METADATA_BACKEND=redis-cluster
+export MX_REDIS_URL=redis://redis-node-0:6379,redis://redis-node-1:6379
 cargo run --bin modelexpress-server
 
 # Kubernetes backend (typically only useful in-cluster)
@@ -116,9 +121,27 @@ reachable.
 
 | Env var | Values | Required | Notes |
 |---------|--------|----------|-------|
-| `MX_METADATA_BACKEND` | `redis` \| `kubernetes` | yes | Selects the backend for both the P2P metadata store and the model registry |
-| `REDIS_URL` | e.g. `redis://host:6379` | when Redis | Redis connection (or set `MX_REDIS_HOST` / `MX_REDIS_PORT`) |
+| `MX_METADATA_BACKEND` | `redis` \| `redis-cluster` \| `kubernetes` | yes | Selects the backend for all metadata stores (P2P, model registry, refit, and collective refit) |
+| `MX_REDIS_MODE` | `standalone` \| `cluster` | no | Defaults to `standalone` when `MX_METADATA_BACKEND=redis`. When `MX_METADATA_BACKEND=redis-cluster`, leave unset or set to `cluster` (`standalone` is rejected as a conflict) |
+| `MX_REDIS_URL` / `REDIS_URL` | e.g. `redis://host:6379` (or comma-separated seed URLs for Cluster) | when Redis | Redis connection (`MX_REDIS_URL` checked first; or set `MX_REDIS_HOST` / `MX_REDIS_PORT`) |
+| `MX_REDIS_CONNECTION_TIMEOUT_MS` | positive integer (default `5000`) | no | Redis Cluster TCP connect timeout in milliseconds |
+| `MX_REDIS_RESPONSE_TIMEOUT_MS` | positive integer (default `10000`) | no | Redis Cluster command response timeout in milliseconds |
+| `MX_REDIS_CLUSTER_RETRIES` | integer `>= 0` (default `8`) | no | Redis Cluster client retries on cluster/topology errors (`0` disables) |
+| `MX_REDIS_CLUSTER_MIN_RETRY_WAIT_MS` | positive integer (default `50`) | no | Initial Redis Cluster retry backoff delay in milliseconds |
+| `MX_REDIS_CLUSTER_MAX_RETRY_WAIT_MS` | positive integer (default `2000`) | no | Maximum Redis Cluster retry backoff delay in milliseconds (clamped `>= min`) |
 | `POD_NAMESPACE` / `MX_METADATA_NAMESPACE` | e.g. `default` | when Kubernetes | Namespace for the `ModelMetadata` and `ModelCacheEntry` CRDs |
+
+In Redis Cluster mode, Model Registry (`mx:model:<Provider>:{m:<model_name>}`) and
+P2P metadata (`mx:source:{<source_id>}` and `mx:source:{<source_id>}:<worker_id>`)
+shard across all primaries by model or source identity. Refit (`mx:{refit}:*`) and
+Collective Refit (`mx:{refit}c:*`) intentionally share a single `{refit}` hash tag so
+multi-key Lua scripts spanning meshes, versions, leases, collective groups, active
+operations, and worker registrations remain atomic on one primary; Refit coordinates
+low-frequency control-plane transitions rather than tensor data-plane traffic.
+Cluster `SCAN` discovers active primaries via `CLUSTER SLOTS` and retries with a
+topology refresh if a primary fails over mid-scan. On standalone connections,
+startup `INFO cluster` logs a warning and falls back to `PING` if restricted ACLs
+or proxies reject `INFO`.
 
 To use the Kubernetes backend in a standalone deployment, apply
 `examples/crds.yaml` before the first deployment and reapply it when upgrading
@@ -842,7 +865,7 @@ Plugins execute inside the worker without sandboxing. Deploy trusted artifacts a
 
 | Variable | Default | Description |
 |----------|---------|-------------|
-| `MX_METADATA_BACKEND` | (required on server; `""` on client) | Server: `redis` or `kubernetes`. Client: `""`/`server`/`redis`/`kubernetes` (central server) or `k8s-service` (decentralized via K8s Service routing). |
+| `MX_METADATA_BACKEND` | (required on server; `""` on client) | Server: `redis`, `redis-cluster`, or `kubernetes`. Client: `""`/`server`/`redis`/`redis-cluster`/`kubernetes` (central server) or `k8s-service` (decentralized via K8s Service routing). |
 | `MX_SERVER_ADDRESS` | `localhost:8001` | Client's gRPC server address (recommended; ignored when client uses `k8s-service` backend) |
 | `MODEL_EXPRESS_URL` | `localhost:8001` | Deprecated in favor of `MX_SERVER_ADDRESS`. Still read by all client paths and still takes precedence when both are set, because the TRT-LLM live-transfer integration reads only this name. It is removed once that path reads `MX_SERVER_ADDRESS`; until then set both to the same value. |
 | `MX_DISABLE_PATCHES` | `0` | Emergency escape hatch that skips all runtime compatibility patches. Set to `1`, `true`, `yes`, or `on` if a patch is incompatible with the installed engine. |
@@ -892,7 +915,13 @@ Plugins execute inside the worker without sandboxing. Deploy trusted artifacts a
 | `MX_K8S_SERVICE_PATTERN` | `mx-sources` | DNS template for the `k8s-service` backend. `{rank}` is substituted with the worker's own rank. If the resolved pattern has no `:port`, the client auto-appends `:{MX_WORKER_GRPC_PORT + rank}` (multi-GPU-per-pod shape); if it has an explicit port, that port is used verbatim (1-GPU-per-pod shape). |
 | `MX_K8S_SOURCE_RETRIES` | `5` | `k8s-service` backend: max retries on `FAILED_PRECONDITION` (revision mismatch during rolling updates). Each retry opens a fresh gRPC channel so kube-proxy re-picks a backend. |
 | `MX_K8S_SOURCE_BACKOFF_SECONDS` | `0.5` | `k8s-service` backend: sleep between retry attempts. |
-| `REDIS_URL` | `redis://localhost:6379` | Redis connection URL (Redis backend only) |
+| `MX_REDIS_MODE` | `standalone` | Redis topology mode (`standalone` or `cluster`; defaults to `standalone` when `MX_METADATA_BACKEND=redis`). When `MX_METADATA_BACKEND=redis-cluster`, leave unset or set to `cluster` (`standalone` is rejected as a conflict). |
+| `MX_REDIS_URL` / `REDIS_URL` | `redis://localhost:6379` | Redis connection URL (or comma-separated seed URLs for Cluster) |
+| `MX_REDIS_CONNECTION_TIMEOUT_MS` | `5000` | Redis Cluster TCP connect timeout in milliseconds |
+| `MX_REDIS_RESPONSE_TIMEOUT_MS` | `10000` | Redis Cluster command response timeout in milliseconds |
+| `MX_REDIS_CLUSTER_RETRIES` | `8` | Maximum Redis Cluster retries on topology/command errors (`0` disables) |
+| `MX_REDIS_CLUSTER_MIN_RETRY_WAIT_MS` | `50` | Initial Redis Cluster retry backoff in milliseconds |
+| `MX_REDIS_CLUSTER_MAX_RETRY_WAIT_MS` | `2000` | Maximum Redis Cluster retry backoff in milliseconds (clamped `>= min`) |
 | `MX_METADATA_NAMESPACE` | `default` | K8s namespace for CRD backend |
 | `VLLM_RPC_TIMEOUT` | `7200000` | vLLM RPC timeout in ms (2 hours for large models) |
 | `VLLM_PLUGINS` | - | For vLLM versions older than 0.23.0, set to `modelexpress` to register the `modelexpress` and `mx` loaders. vLLM 0.23.0 and newer recognize the load format natively. |

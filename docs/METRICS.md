@@ -378,7 +378,7 @@ minutes and failed. `Health/Watch` is excluded for the same reason. Timing these
 means instrumenting the response body, which is a later change; until then they
 are absent rather than wrong. `store` names the subsystem (`p2p`, `registry`, `refit`),
 not the storage engine -- only one engine is live per pod, so the engine is
-carried by `mx_build_info{backend=...}` and joined from there.
+carried by `mx_build_info{backend=...}` (`redis`, `redis-cluster`, `kubernetes`, or `memory`) and joined from there.
 
 #### `outcome` is not the gRPC status code
 

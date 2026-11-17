@@ -2,12 +2,12 @@
 # SPDX-License-Identifier: Apache-2.0
 
 {{- if and .Values.env .Values.env.MX_METADATA_BACKEND }}
-{{- if eq .Values.env.MX_METADATA_BACKEND "redis" }}
+{{- if or (eq .Values.env.MX_METADATA_BACKEND "redis") (eq .Values.env.MX_METADATA_BACKEND "redis-cluster") }}
 
 IMPORTANT: This chart does NOT deploy Redis. The server is configured with
-MX_METADATA_BACKEND=redis and REDIS_URL={{ .Values.env.REDIS_URL | default "<unset>" }} —
-you must have a reachable Redis Service at that host in namespace {{ .Release.Namespace }},
-or override env.REDIS_URL to point at your own instance.
+MX_METADATA_BACKEND={{ .Values.env.MX_METADATA_BACKEND }}{{- if .Values.env.MX_REDIS_MODE }} (MX_REDIS_MODE={{ .Values.env.MX_REDIS_MODE }}){{- end }} and {{ if .Values.env.MX_REDIS_URL }}MX_REDIS_URL={{ .Values.env.MX_REDIS_URL }}{{ else }}REDIS_URL={{ .Values.env.REDIS_URL | default "<unset>" }}{{ end }} —
+you must have reachable Redis endpoints in namespace {{ .Release.Namespace }},
+or override env.MX_REDIS_URL / env.REDIS_URL (comma-separated seed URLs for Redis Cluster).
 {{- end }}
 {{- if eq .Values.env.MX_METADATA_BACKEND "kubernetes" }}
 
@@ -29,7 +29,7 @@ ModelCacheEntry resources with the Kubernetes backend.
 {{- else }}
 
 WARNING: MX_METADATA_BACKEND is not set in values. The server will fail to start —
-set env.MX_METADATA_BACKEND to "redis" or "kubernetes" (with the matching
+set env.MX_METADATA_BACKEND to "redis", "redis-cluster", or "kubernetes" (with the matching
 connection settings) and re-run `helm upgrade`.
 {{- end }}
 {{- if and .Values.env (hasKey .Values.env "MODEL_EXPRESS_SERVER_PORT") }}

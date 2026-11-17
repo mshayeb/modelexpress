@@ -226,15 +226,21 @@ env:
   MODEL_EXPRESS_LOG_LEVEL: "info"
   MODEL_EXPRESS_CACHE_DIRECTORY: "/root"
   # Distributed backend selection. Required — the server fails to start without it.
-  # Set MX_METADATA_BACKEND to "redis" or "kubernetes"; it drives both the P2P metadata
-  # store and the model registry.
+  # Set MX_METADATA_BACKEND to "redis", "redis-cluster", or "kubernetes"; it drives
+  # both the P2P metadata store and the model registry.
   #
-  # When "redis": also set REDIS_URL to your cluster's Redis service (e.g.
-  # "redis://redis.default.svc:6379"). The chart does not bundle a Redis sub-chart.
+  # When "redis": also set MX_REDIS_URL or REDIS_URL (e.g.
+  # "redis://redis.default.svc:6379"). For Redis Cluster with MX_METADATA_BACKEND="redis",
+  # set MX_REDIS_MODE="cluster" and pass comma-separated seed URLs in MX_REDIS_URL/REDIS_URL.
+  # When "redis-cluster": shorthand for MX_METADATA_BACKEND="redis" + MX_REDIS_MODE="cluster";
+  # set MX_REDIS_URL or REDIS_URL to one or more comma-separated cluster seed URLs
+  # (e.g. "redis://redis-cluster-0:6379,redis://redis-cluster-1:6379").
+  # The chart does not bundle a Redis sub-chart.
   # When "kubernetes": set serviceAccount.rbac.enabled=true to grant the server
   # access to ModelMetadata and ModelCacheEntry resources.
   #
   # MX_METADATA_BACKEND: "redis"
+  # MX_REDIS_MODE: "standalone"
   # REDIS_URL: "redis://redis.default.svc:6379"
 
 # Both probes target the gRPC listener. Leave tcpSocket unset and they follow
