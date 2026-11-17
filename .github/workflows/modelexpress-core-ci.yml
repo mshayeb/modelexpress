@@ -515,6 +515,57 @@ jobs:
         fi
       continue-on-error: true
 
+  redis-cluster-test:
+    name: Redis Cluster Integration Tests
+    runs-on: ${{ inputs.runs_on || 'ubuntu-24.04' }}
+    needs: test
+    timeout-minutes: 25
+
+    steps:
+    - name: Checkout repository
+      uses: actions/checkout@v7
+      with:
+        persist-credentials: false
+
+    - name: Install Rust toolchain
+      run: |
+        curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --default-toolchain stable
+        echo "$HOME/.cargo/bin" >> $GITHUB_PATH
+
+    - name: Cache dependencies
+      if: inputs.runs_on == ''
+      uses: actions/cache@v6
+      with:
+        path: |
+          ~/.cargo/registry
+          ~/.cargo/git
+          target/
+        key: ${{ runner.os }}-cargo-stable-${{ hashFiles('**/Cargo.lock') }}
+        restore-keys: |
+          ${{ runner.os }}-cargo-stable-
+          ${{ runner.os }}-cargo-
+
+    - name: Install system dependencies
+      run: |
+        sudo apt-get update
+        sudo apt-get install -y protobuf-compiler build-essential
+
+    - name: Start 6-node Redis Cluster
+      run: ./ci/scripts/redis_cluster.sh start
+
+    - name: Run Redis Cluster integration & failover tests
+      env:
+        MX_REDIS_URL: redis://127.0.0.1:7000,redis://127.0.0.1:7001,redis://127.0.0.1:7002,redis://127.0.0.1:7003,redis://127.0.0.1:7004,redis://127.0.0.1:7005
+        MX_TEST_ENABLE_CLUSTER_FAILOVER: "1"
+      run: |
+        cargo test -p model-express-workspace-tests \
+          --test redis_cluster_integration \
+          -- --include-ignored --test-threads=1
+
+    - name: Stop Redis Cluster
+      if: always()
+      run: ./ci/scripts/redis_cluster.sh stop
+
   security-audit:
     name: Security Audit
     runs-on: ${{ inputs.runs_on || 'ubuntu-24.04' }}
@@ -602,9 +653,30 @@ jobs:
         cargo llvm-cov --all-features --workspace --no-report
         cargo llvm-cov --all-features -p modelexpress-server --lib --no-report -- \
           p2p:: --ignored --test-threads=1
+        cargo llvm-cov --all-features -p modelexpress-server --lib --no-report -- \
+          refit_collective::backend::redis::tests --ignored --test-threads=1
+        cargo llvm-cov --all-features -p model-express-workspace-tests \
+          --test registry_backend_redis --no-report -- --include-ignored --test-threads=1
         cargo llvm-cov --all-features -p model-express-workspace-tests \
           --test refit_service_redis --no-report -- --include-ignored
+        cargo llvm-cov --all-features -p model-express-workspace-tests \
+          --test refit_collective_service_redis --no-report -- --include-ignored --test-threads=1
+
+    - name: Start 6-node Redis Cluster for coverage
+      run: ./ci/scripts/redis_cluster.sh start
+
+    - name: Generate Redis Cluster code coverage
+      env:
+        MX_REDIS_URL: redis://127.0.0.1:7000,redis://127.0.0.1:7001,redis://127.0.0.1:7002,redis://127.0.0.1:7003,redis://127.0.0.1:7004,redis://127.0.0.1:7005
+        MX_TEST_ENABLE_CLUSTER_FAILOVER: "1"
+      run: |
+        cargo llvm-cov --all-features -p model-express-workspace-tests \
+          --test redis_cluster_integration --no-report -- --include-ignored --test-threads=1
         cargo llvm-cov report --lcov --output-path lcov.info
+
+    - name: Stop Redis Cluster
+      if: always()
+      run: ./ci/scripts/redis_cluster.sh stop
 
     - name: Upload coverage to Codecov
       uses: codecov/codecov-action@v7
